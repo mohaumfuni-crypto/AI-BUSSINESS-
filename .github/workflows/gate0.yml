@@ -1,0 +1,107 @@
+#.github/workflows/gate0.yml
+# HOWZA GATE 0 — independent CI evidence generation.
+#
+# This workflow GENERATES EVIDENCE. It does NOT grant authority.
+# A green run means the Gate 0 suite itself reported PASS under its own
+# rules. A red run (FAIL, BLOCKED BY DEPENDENCY, or UNKNOWN) blocks Phase 1.
+# CI execution never converts UNKNOWN into PASS and never suppresses
+# exceptions: the job fails whenever test_gate0.py exits non-zero.
+#
+# SECURITY: this workflow contains no secrets, no credentials, no signing
+# keys, no broker/API keys, and no trading capability. It installs no
+# third-party packages (stdlib only). Test databases are isolated
+# temp files on the ephemeral runner and are never uploaded.
+
+name: GATE-0
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - governance.py
+      - test_gate0.py
+      -.github/workflows/gate0.yml
+
+permissions:
+  contents: read
+
+jobs:
+  gate0:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Identify execution environment
+        run: |
+          echo "ENVIRONMENT=github-actions ubuntu-latest"
+          python --version
+          echo "COMMIT_SHA=${GITHUB_SHA}"
+          grep -E '^IMPL_VERSION' governance.py
+          grep -E '^SUITE_VERSION' test_gate0.py
+          echo "EXECUTION_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      - name: Record CI environment metadata
+        env:
+          HOWZA_COMMIT_SHA: ${{ github.sha }}
+        run: |
+          python - <<'PYEOF'
+          import json
+          import os
+          import platform
+          # Quoted heredoc: no shell interpolation occurs inside.
+          # The commit SHA arrives via the explicit HOWZA_COMMIT_SHA
+          # environment variable set on this step.
+          sha = os.environ.get("HOWZA_COMMIT_SHA", "")
+          assert sha, "HOWZA_COMMIT_SHA is empty; cannot record provenance"
+          env = {
+              "environment": "github-actions",
+              "runner_os": "ubuntu-latest",
+              "python_version": platform.python_version(),
+              "commit_sha": sha,
+              "governance_version": "phase0-2.1.0",
+              "test_suite_version": "gate0-2.1",
+          }
+          open("ci_environment.json", "w").write(json.dumps(env, indent=2))
+          print(json.dumps(env, indent=2))
+          PYEOF
+
+      - name: Execute Gate 0 test suite
+        run: |
+          set -o pipefail
+          python test_gate0.py 2>&1 | tee gate0_run.log
+          # pipefail propagates the suite's exit code: non-zero (any FAIL,
+          # any UNKNOWN, any BLOCKED) fails this job. Nothing is reinterpreted.
+
+      - name: Extract Gate 0 JSON report
+        if: always()
+        run: |
+          python - <<'PYEOF'
+          import json
+          log = open("gate0_run.log").read()
+          marker = "==== GATE 0 REPORT ===="
+          assert marker in log, "Gate 0 report marker missing from output"
+          report = json.loads(log.split(marker, 1)[1].strip())
+          open("gate0_report.json", "w").write(json.dumps(report, indent=2))
+          print("GATE_RESULT=" + report["gate_decision"])
+          print("TEST_RESULTS run=%d passed=%d failed=%d unknown=%d skipped=%d"
+                % (report["tests_run"], report["tests_passed"],
+                   report["tests_failed"], report["unknown_tests"],
+                   report["skipped_tests"]))
+          PYEOF
+
+      - name: Upload Gate 0 evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate0-evidence-${{ github.sha }}
+          path: |
+            gate0_run.log
+            gate0_report.json
+            ci_environment.json
+          if-no-files-found: error
