@@ -133,6 +133,8 @@ def main() -> None:
     summary = {"verdict": evidence["verdict"],
                "evidence_file": EVIDENCE_PATH, "gates": gates}
     print(json.dumps(summary, indent=2))
+    print("STATIC_AUDIT_DETAIL=" + json.dumps(evidence["static_audit"]))
+    print("EXECUTION_PROBE_DETAIL=" + json.dumps(evidence["execution_probe"]))
     sys.exit(0 if evidence["verdict"] == "VERIFIED" else 1)
 
 if __name__ == "__main__":
