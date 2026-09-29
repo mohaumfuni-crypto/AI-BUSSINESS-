@@ -14,6 +14,12 @@ trust_snapshot() with no arguments evaluates a FixtureProvider at
 REFERENCE_EVALUATION_TIME. provider, instrument, timeframe and
 evaluated_at may also be supplied positionally or by keyword.
 
+FixtureProvider conforms exactly to the frozen MarketDataProvider
+contract: provider_id, provider_name and health are read-only
+properties on the frozen base, so FixtureProvider overrides them as
+read-only properties and never assigns to them. FixtureProvider()
+instantiates with no arguments.
+
 Snapshot contract keys (exactly):
     status, checks, errors, evaluated_at, provider_id, symbol, timeframe
 Every check is exactly {"state":..., "detail":...} with state one of
@@ -48,7 +54,6 @@ _REQUIRED_PHASE1A = (
     "SUPPORTED_INSTRUMENTS",
     "classify_freshness",
     "comparable_fields",
-    "trust_lifecycle",
 )
 
 _PROVIDER_ATTRS = (
@@ -123,11 +128,12 @@ def _check(state: str, detail: str) -> Dict[str, str]:
     return {"state": state, "detail": detail}
 
 def check_frozen_interfaces() -> Dict[str, Any]:
-    """Audit the frozen Phase 1A interface surface Phase 1B depends on.
+    """Audit the frozen interfaces Phase 1B depends on and must expose.
 
-    Returns {"passed": bool, "details": {...}}; passed is True only when
-    every required module name and every required MarketDataProvider
-    attribute exists.
+    Verifies every required frozen Phase 1A name, every required
+    MarketDataProvider attribute, and that this module itself exposes a
+    callable module-level trust_lifecycle as the Phase 1B public contract
+    requires. Returns {"passed": bool, "details": {...}}.
     """
     details: Dict[str, Any] = {}
     ok = True
@@ -140,6 +146,9 @@ def check_frozen_interfaces() -> Dict[str, Any]:
         present = hasattr(phase1a.MarketDataProvider, attr)
         details[key] = present
         ok = ok and present
+    own_lifecycle = globals().get("trust_lifecycle")
+    details["trust_lifecycle"] = callable(own_lifecycle)
+    ok = ok and details["trust_lifecycle"]
     try:
         details["freshness_class_members"] = sorted(
             str(getattr(m, "name", m)) for m in phase1a.FreshnessClass
@@ -213,19 +222,36 @@ class FixtureProvider(phase1a.MarketDataProvider):
 
     Implements the frozen MarketDataProvider surface (supports_instrument,
     symbol/timeframe conversion, get_source_records, source_id_for,
-    health, provider_id, provider_name) and generates a small set of
-    internally consistent source records anchored at the evaluation time,
-    so freshness classification is deterministic.
+    health, provider_id, provider_name). The frozen base defines
+    provider_id, provider_name (and health) as read-only properties, so
+    this class overrides them as read-only properties and never assigns
+    to them. Generates a small set of internally consistent source
+    records anchored at the evaluation time, so freshness classification
+    is deterministic.
     """
+
+    @property
+    def provider_id(self) -> str:
+        return "fixture-provider"
+
+    @property
+    def provider_name(self) -> str:
+        return "Fixture Provider"
+
+    @property
+    def health(self) -> Optional[Any]:
+        return _health_member(["UP", "HEALTHY", "OK", "ONLINE", "ACTIVE"])
 
     def __init__(
         self,
-        provider_id: str = "fixture-provider",
-        provider_name: str = "Fixture Provider",
+        provider_id: Optional[str] = None,
+        provider_name: Optional[str] = None,
         candle_count: int = 5,
     ):
-        self.provider_id = provider_id
-        self.provider_name = provider_name
+        # provider_id / provider_name are read-only properties on the
+        # frozen base: assignment would raise AttributeError, and the
+        # property always returns the fixture identity. Accepted here
+        # only for call compatibility; values are ignored.
         self.candle_count = candle_count
 
     def supports_instrument(self, instrument: str) -> bool:
@@ -249,10 +275,6 @@ class FixtureProvider(phase1a.MarketDataProvider):
             if sid is not None:
                 return str(sid)
         return "fixture-source"
-
-    @property
-    def health(self) -> Optional[Any]:
-        return _health_member(["UP", "HEALTHY", "OK", "ONLINE", "ACTIVE"])
 
     def get_health(self) -> Optional[Any]:
         return self.health
@@ -436,8 +458,8 @@ def _run_frozen_interfaces_check(errors: List[str]) -> Dict[str, str]:
     try:
         frozen = check_frozen_interfaces()
         if frozen["passed"]:
-            required = len(_REQUIRED_PHASE1A) + len(_PROVIDER_ATTRS)
-            return _check("pass", "all %d frozen Phase 1A names present" % required)
+            required = len(_REQUIRED_PHASE1A) + len(_PROVIDER_ATTRS) + 1
+            return _check("pass", "all %d frozen interfaces present" % required)
         missing = [k for k, v in frozen["details"].items() if v is False]
         return _check("fail", "missing frozen interfaces: %s" % ", ".join(missing))
     except Exception as exc:
