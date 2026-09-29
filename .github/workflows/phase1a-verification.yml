@@ -1,0 +1,47 @@
+name: Phase 1A Verification
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify-phase1a:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        run: python -m pip install pytest
+
+      - name: Run Phase 1A tests
+        working-directory: phase1a-execution
+        run: python -m pytest test_phase1a.py -q
+
+      - name: Run Phase 1A verifier
+        working-directory: phase1a-execution
+        run: python run_phase1a.py
+
+      - name: Verify evidence
+        working-directory: phase1a-execution
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path("phase1a_evidence.json")
+          assert p.exists(), "Evidence file was not created"
+
+          data = json.loads(p.read_text())
+          assert data["verdict"] == "VERIFIED"
+          assert data["gates"]["static_audit"] is True
+          assert data["gates"]["execution_probe"] is True
+          assert data["gates"]["pytest"] is True
+
+          print(json.dumps(data, indent=2))
+          PY
