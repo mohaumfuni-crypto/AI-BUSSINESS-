@@ -20,7 +20,7 @@ on:
     paths:
       - governance.py
       - test_gate0.py
-      -.github/workflows/gate0.yml
+      - ".github/workflows/gate0.yml"
 
 permissions:
   contents: read
