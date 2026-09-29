@@ -87,7 +87,7 @@ def execution_probe() -> dict:
         result["checks"]["module_executes"] = True
     except Exception:
         result["checks"]["module_executes"] = False
-        result["error"] = traceback.format_exc(limit=3)
+        result["error"] = traceback.format_exc()
         return result
 
     try:
@@ -99,7 +99,7 @@ def execution_probe() -> dict:
         result["passed"] = ok
     except Exception:
         result["checks"]["lifecycle_callable"] = False
-        result["error"] = traceback.format_exc(limit=3)
+        result["error"] = traceback.format_exc()
     return result
 
 def run_pytest() -> dict:
