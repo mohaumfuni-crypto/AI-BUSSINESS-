@@ -1,264 +1,295 @@
-"""HOWZA Phase 1A behavioural tests. Targets howza_market_data.py (commit 1c42948)."""
-import dataclasses
-import inspect
-from datetime import datetime, timedelta, timezone
+"""
+HOWZA Phase 1A - C1 Canonical Schemas + C2 Market Data Interface.
+Implementation version: phase1a-1.0.0
+Lifecycle target: AUTHORED -> STATICALLY AUDITED -> EXECUTED -> TESTED -> VERIFIED
+Architectural rules (locked):
+- No network calls. No credentials. No secrets. No trading capability.
+- No provider-specific detail leaks into the canonical model.
+- volume UNKNOWN is represented explicitly (None) and never fabricated.
+- Freshness thresholds live in versioned configuration, never in engine logic.
+- All canonical records are immutable (frozen dataclasses).
+- All timestamps are timezone-aware UTC; naive datetimes are rejected.
+"""
 
-import pytest
+from __future__ import annotations
 
-from howza_market_data import (
-    SUPPORTED_INSTRUMENTS,
-    Candle,
-    ConflictRecord,
-    FreshnessClass,
-    FreshnessPolicy,
-    MarketDataProvider,
-    ProviderError,
-    ProviderHealth,
-    ProviderHealthStatus,
-    QualityState,
-    SourceRecord,
-    TimeframeState,
-    TrustedMarketState,
-    VerificationState,
-    classify_freshness,
-    comparable_fields,
+import abc
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Optional, Tuple
+
+class VerificationState(Enum):
+    VERIFIED = "VERIFIED"
+    SINGLE_SOURCE = "SINGLE_SOURCE"
+    DATA_CONFLICT = "DATA_CONFLICT"
+    STALE = "STALE"
+    INVALID = "INVALID"
+    NO_DATA = "NO_DATA"
+
+class QualityState(Enum):
+    NOMINAL = "NOMINAL"
+    DEGRADED = "DEGRADED"
+    CRITICAL = "CRITICAL"
+    UNUSABLE = "UNUSABLE"
+
+class FreshnessClass(Enum):
+    FRESH = "FRESH"
+    AGING = "AGING"
+    STALE = "STALE"
+
+class ProviderHealthStatus(Enum):
+    UP = "UP"
+    DEGRADED = "DEGRADED"
+    DOWN = "DOWN"
+
+SUPPORTED_INSTRUMENTS: Tuple[str,...] = (
+    "XAUUSD", "EURUSD", "GBPUSD", "BTCUSD",
+    "NAS100", "US30", "DXY", "US10Y",
 )
 
-def _now():
-    return datetime.now(timezone.utc)
+def _require_aware_utc(name: str, value: datetime) -> datetime:
+    if not isinstance(value, datetime):
+        raise TypeError(f"{name} must be a datetime")
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        raise ValueError(f"{name} must be timezone-aware UTC; naive rejected")
+    return value.astimezone(timezone.utc)
 
-def _mk_candle(**kw):
-    d = dict(
-        instrument="XAUUSD", timeframe="M5",
-        open_time_utc=_now() - timedelta(minutes=1), close_time_utc=_now(),
-        open=100.0, high=101.0, low=99.0, close=100.5, volume=None,
-        is_closed=True, source_id="prov-a:XAUUSD:M5", received_at_utc=_now(),
-    )
-    d.update(kw)
-    return Candle(**d)
+def _require_number(name: str, value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be numeric")
+    v = float(value)
+    if v!= v or v in (float("inf"), float("-inf")):
+        raise ValueError(f"{name} must be finite (NaN/inf rejected)")
+    return v
 
-class MockProvider(MarketDataProvider):
-    def __init__(s, pid, price, volume=None, delay=0.0):
-        s._pid, s._price, s._vol, s._delay = pid, price, volume, delay
+@dataclass(frozen=True)
+class Candle:
+    instrument: str
+    timeframe: str
+    open_time_utc: datetime
+    close_time_utc: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: Optional[float]
+    is_closed: bool
+    source_id: str
+    received_at_utc: datetime
+
+    def __post_init__(self):
+        if self.instrument not in SUPPORTED_INSTRUMENTS:
+            raise ValueError(f"unknown instrument: {self.instrument!r}")
+        if not self.timeframe or not isinstance(self.timeframe, str):
+            raise ValueError("timeframe must be a non-empty string")
+        ot = _require_aware_utc("open_time_utc", self.open_time_utc)
+        ct = _require_aware_utc("close_time_utc", self.close_time_utc)
+        if not ot < ct:
+            raise ValueError("open_time_utc must be before close_time_utc")
+        o = _require_number("open", self.open)
+        h = _require_number("high", self.high)
+        lo = _require_number("low", self.low)
+        c = _require_number("close", self.close)
+        if h < max(o, c):
+            raise ValueError("impossible OHLC: high below open/close")
+        if lo > min(o, c):
+            raise ValueError("impossible OHLC: low above open/close")
+        if self.volume is not None:
+            v = _require_number("volume", self.volume)
+            if v < 0:
+                raise ValueError("volume must be >= 0 or None (UNKNOWN)")
+        if not isinstance(self.is_closed, bool):
+            raise TypeError("is_closed must be bool")
+        if not self.source_id or not isinstance(self.source_id, str):
+            raise ValueError("source_id must be a non-empty string")
+        _require_aware_utc("received_at_utc", self.received_at_utc)
+        object.__setattr__(self, "open_time_utc", ot)
+        object.__setattr__(self, "close_time_utc", ct)
+        object.__setattr__(self, "open", o)
+        object.__setattr__(self, "high", h)
+        object.__setattr__(self, "low", lo)
+        object.__setattr__(self, "close", c)
 
     @property
-    def provider_id(s):
-        return s._pid
+    def has_volume(self) -> bool:
+        return self.volume is not None
+
+@dataclass(frozen=True)
+class SourceRecord:
+    source_id: str
+    provider_id: str
+    instrument: str
+    received_at_utc: datetime
+    candle: Candle
+    raw_ref: str = ""
+
+    def __post_init__(self):
+        if not self.source_id or not isinstance(self.source_id, str):
+            raise ValueError("source_id must be a non-empty string")
+        if not self.provider_id or not isinstance(self.provider_id, str):
+            raise ValueError("provider_id must be a non-empty string")
+        if self.candle.instrument!= self.instrument:
+            raise ValueError("SourceRecord.instrument must match candle")
+        _require_aware_utc("received_at_utc", self.received_at_utc)
+
+@dataclass(frozen=True)
+class ConflictRecord:
+    instrument: str
+    conflicting_fields: Tuple[str,...]
+    observations: Tuple[Tuple[str, str],...]
+    detected_at_utc: datetime
+    tolerance_policy_ref: str = ""
+
+    def __post_init__(self):
+        if self.instrument not in SUPPORTED_INSTRUMENTS:
+            raise ValueError(f"unknown instrument: {self.instrument!r}")
+        if not self.conflicting_fields:
+            raise ValueError("conflicting_fields must be non-empty")
+        if len(self.observations) < 2:
+            raise ValueError("a conflict requires at least two observations")
+        _require_aware_utc("detected_at_utc", self.detected_at_utc)
+
+@dataclass(frozen=True)
+class TimeframeState:
+    timeframe: str
+    verification_state: VerificationState
+    candle_count: int
+    latest_close_time_utc: Optional[datetime] = None
+
+    def __post_init__(self):
+        if self.candle_count < 0:
+            raise ValueError("candle_count must be >= 0")
+        if self.latest_close_time_utc is not None:
+            _require_aware_utc("latest_close_time_utc", self.latest_close_time_utc)
+
+@dataclass(frozen=True)
+class TrustedMarketState:
+    instrument: str
+    as_of_utc: datetime
+    trusted_price: Optional[float]
+    price_source: Optional[str]
+    sources: Tuple[str,...]
+    verification_state: VerificationState
+    quality_state: QualityState
+    freshness_seconds: Optional[float]
+    conflicts: Tuple[ConflictRecord,...] = ()
+    missing_fields: Tuple[str,...] = ()
+    last_verified_state: Optional["TrustedMarketState"] = None
+    downgrade_reason: Optional[str] = None
+    evidence_refs: Tuple[str,...] = ()
+    timeframe_states: Tuple[TimeframeState,...] = ()
+
+    def __post_init__(self):
+        if self.instrument not in SUPPORTED_INSTRUMENTS:
+            raise ValueError(f"unknown instrument: {self.instrument!r}")
+        _require_aware_utc("as_of_utc", self.as_of_utc)
+        if self.trusted_price is not None:
+            _require_number("trusted_price", self.trusted_price)
+        bad = (VerificationState.NO_DATA, VerificationState.INVALID)
+        if self.verification_state in bad and self.trusted_price is not None:
+            raise ValueError("trusted_price must be None when NO_DATA/INVALID")
+        if not isinstance(self.verification_state, VerificationState):
+            raise TypeError("verification_state must be a VerificationState")
+        if not isinstance(self.quality_state, QualityState):
+            raise TypeError("quality_state must be a QualityState")
+        if self.freshness_seconds is not None and self.freshness_seconds < 0:
+            raise ValueError("freshness_seconds must be >= 0 or None")
+
+@dataclass(frozen=True)
+class FreshnessPolicy:
+    instrument: str
+    timeframe: str
+    fresh_seconds: float
+    aging_seconds: float
+    stale_seconds: float
+    policy_version: str
+
+    def __post_init__(self):
+        if self.instrument not in SUPPORTED_INSTRUMENTS:
+            raise ValueError(f"unknown instrument: {self.instrument!r}")
+        if not self.timeframe or not isinstance(self.timeframe, str):
+            raise ValueError("timeframe must be a non-empty string")
+        for name in ("fresh_seconds", "aging_seconds", "stale_seconds"):
+            v = _require_number(name, getattr(self, name))
+            if v < 0:
+                raise ValueError(f"{name} must be >= 0")
+        ok = self.fresh_seconds <= self.aging_seconds <= self.stale_seconds
+        if not ok:
+            raise ValueError("need fresh <= aging <= stale")
+        if not self.policy_version or not isinstance(self.policy_version, str):
+            raise ValueError("policy_version must be a non-empty string")
+
+def classify_freshness(policy: FreshnessPolicy, age_seconds: float) -> FreshnessClass:
+    if not isinstance(policy, FreshnessPolicy):
+        raise TypeError("policy must be a FreshnessPolicy")
+    age = _require_number("age_seconds", age_seconds)
+    if age < 0:
+        raise ValueError("age_seconds must be >= 0")
+    if age <= policy.fresh_seconds:
+        return FreshnessClass.FRESH
+    if age <= policy.aging_seconds:
+        return FreshnessClass.AGING
+    return FreshnessClass.STALE
+
+COMPARABLE_PRICE_FIELDS: Tuple[str,...] = ("open", "high", "low", "close")
+
+def comparable_fields(candles: Tuple[Candle,...]) -> Tuple[str,...]:
+    fields = list(COMPARABLE_PRICE_FIELDS)
+    if all(c.has_volume for c in candles):
+        fields.append("volume")
+    return tuple(fields)
+
+@dataclass(frozen=True)
+class ProviderHealth:
+    provider_id: str
+    status: ProviderHealthStatus
+    at_utc: datetime
+    detail: str = ""
+
+    def __post_init__(self):
+        _require_aware_utc("at_utc", self.at_utc)
+        if not isinstance(self.status, ProviderHealthStatus):
+            raise TypeError("status must be a ProviderHealthStatus")
+
+class ProviderError(Exception):
+    def __init__(self, provider_id: str, code: str, message: str):
+        super().__init__(f"[{provider_id}] {code}: {message}")
+        self.provider_id = provider_id
+        self.code = code
+
+class MarketDataProvider(abc.ABC):
 
     @property
-    def provider_name(s):
-        return "Mock " + s._pid
+    @abc.abstractmethod
+    def provider_id(self) -> str:...
 
-    def to_provider_symbol(s, i):
-        if i not in SUPPORTED_INSTRUMENTS:
-            raise ValueError(i)
-        return "MOCK:" + i
+    @property
+    @abc.abstractmethod
+    def provider_name(self) -> str:...
 
-    def to_howza_instrument(s, p):
-        i = p.split(":", 1)[1]
-        if i not in SUPPORTED_INSTRUMENTS:
-            raise ValueError(p)
-        return i
+    @abc.abstractmethod
+    def to_provider_symbol(self, howza_instrument: str) -> str:...
 
-    def to_provider_timeframe(s, t):
-        return "tf-" + t
+    @abc.abstractmethod
+    def to_howza_instrument(self, provider_symbol: str) -> str:...
 
-    def to_howza_timeframe(s, t):
-        if not t.startswith("tf-"):
-            raise ValueError(t)
-        return t[3:]
+    @abc.abstractmethod
+    def to_provider_timeframe(self, howza_timeframe: str) -> str:...
 
-    def get_source_records(s, i, t, limit=1):
-        n = _now() - timedelta(seconds=s._delay)
-        c = _mk_candle(
-            instrument=i, timeframe=t, open=s._price, high=s._price,
-            low=s._price, close=s._price, volume=s._vol,
-            open_time_utc=n - timedelta(minutes=1), close_time_utc=n,
-            received_at_utc=n, source_id=s.source_id_for(i, t),
-        )
-        return tuple(
-            SourceRecord(source_id=c.source_id, provider_id=s._pid,
-                         instrument=i, received_at_utc=n, candle=c)
-            for _ in range(limit)
-        )
+    @abc.abstractmethod
+    def to_howza_timeframe(self, provider_timeframe: str) -> str:...
 
-    def source_id_for(s, i, t):
-        return s._pid + ":" + i + ":" + t
+    @abc.abstractmethod
+    def get_source_records(self, howza_instrument: str, howza_timeframe: str,
+                           limit: int = 1) -> Tuple[SourceRecord,...]:
+        """Return provider observations as canonical SourceRecords."""
 
-    def health(s):
-        return ProviderHealth(provider_id=s._pid,
-                              status=ProviderHealthStatus.UP, at_utc=_now())
+    @abc.abstractmethod
+    def source_id_for(self, howza_instrument: str, howza_timeframe: str) -> str:...
 
-def _mk_state(**kw):
-    d = dict(instrument="EURUSD", as_of_utc=_now(), trusted_price=None,
-             price_source=None, sources=(),
-             verification_state=VerificationState.NO_DATA,
-             quality_state=QualityState.CRITICAL, freshness_seconds=None)
-    d.update(kw)
-    return TrustedMarketState(**d)
+    @abc.abstractmethod
+    def health(self) -> ProviderHealth:...
 
-def _mk_conflict():
-    return ConflictRecord(
-        instrument="EURUSD", conflicting_fields=("close",),
-        observations=(("prov-a", "100.0"), ("prov-b", "100.5")),
-        detected_at_utc=_now(),
-    )
-
-def test_instruments(): # req 5
-    assert SUPPORTED_INSTRUMENTS == (
-        "XAUUSD", "EURUSD", "GBPUSD", "BTCUSD",
-        "NAS100", "US30", "DXY", "US10Y",
-    )
-    p = MockProvider("p", 1.0)
-    for i in SUPPORTED_INSTRUMENTS:
-        assert p.supports_instrument(i)
-
-def test_unknown_instrument(): # req 6
-    with pytest.raises(ValueError):
-        _mk_candle(instrument="FAKE")
-    with pytest.raises(ValueError):
-        MockProvider("p", 1.0).to_provider_symbol("FAKE")
-    assert not MockProvider("p", 1.0).supports_instrument("FAKE")
-
-def test_naive_rejected(): # req 7
-    with pytest.raises(ValueError):
-        _mk_candle(open_time_utc=datetime(2026, 1, 1))
-    with pytest.raises(ValueError):
-        _mk_candle(received_at_utc=datetime(2026, 1, 1, 12, 0, 0))
-
-def test_aware_normalized(): # req 8
-    aware = datetime(2026, 1, 1, 12, 0, 0,
-                     tzinfo=timezone(timedelta(hours=2)))
-    c = _mk_candle(open_time_utc=aware,
-                   close_time_utc=aware + timedelta(minutes=1))
-    assert c.open_time_utc.tzinfo == timezone.utc
-    assert c.open_time_utc.hour == 10
-
-def test_impossible_ohlc(): # req 9
-    with pytest.raises(ValueError):
-        _mk_candle(high=50.0)
-    with pytest.raises(ValueError):
-        _mk_candle(low=150.0)
-
-def test_nan_inf(): # req 10
-    for bad in (float("nan"), float("inf"), float("-inf")):
-        with pytest.raises(ValueError):
-            _mk_candle(close=bad)
-
-def test_bool_rejected(): # req 11
-    with pytest.raises(TypeError):
-        _mk_candle(open=True)
-    with pytest.raises(TypeError):
-        _mk_candle(is_closed=1)
-
-def test_frozen(): # req 12
-    c = _mk_candle()
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        c.close = 1.0
-    s = _mk_state(verification_state=VerificationState.VERIFIED,
-                  quality_state=QualityState.NOMINAL, trusted_price=1.0,
-                  price_source="p", sources=("p",), freshness_seconds=1.0)
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        s.trusted_price = 2.0
-
-def test_volume_unknown(): # req 13
-    c = _mk_candle(volume=None)
-    assert c.volume is None and not c.has_volume
-
-def test_no_fabricated_volume(): # req 14
-    a = _mk_candle(volume=None)
-    b = _mk_candle(volume=10.0)
-    assert "volume" not in comparable_fields((a,))
-    assert "volume" in comparable_fields((b, _mk_candle(volume=5.0)))
-
-def test_policy_validation(): # req 15
-    ok = dict(instrument="XAUUSD", timeframe="M1", fresh_seconds=30.0,
-              aging_seconds=120.0, stale_seconds=300.0,
-              policy_version="2026-09-29")
-    FreshnessPolicy(**ok)
-    with pytest.raises(ValueError):
-        FreshnessPolicy(**dict(ok, aging_seconds=10.0))
-    with pytest.raises(ValueError):
-        FreshnessPolicy(**dict(ok, policy_version=""))
-
-def test_freshness_boundaries(): # req 16
-    p = FreshnessPolicy(instrument="XAUUSD", timeframe="M1",
-                        fresh_seconds=30.0, aging_seconds=120.0,
-                        stale_seconds=300.0, policy_version="v1")
-    assert classify_freshness(p, 0.0) is FreshnessClass.FRESH
-    assert classify_freshness(p, 30.0) is FreshnessClass.FRESH
-    assert classify_freshness(p, 31.0) is FreshnessClass.AGING
-    assert classify_freshness(p, 120.0) is FreshnessClass.AGING
-    assert classify_freshness(p, 121.0) is FreshnessClass.STALE
-    assert classify_freshness(p, 3600.0) is FreshnessClass.STALE
-    with pytest.raises(ValueError):
-        classify_freshness(p, -1.0)
-    with pytest.raises(TypeError):
-        classify_freshness("x", 1.0)
-
-def test_no_data_no_price(): # req 17
-    _mk_state()
-    with pytest.raises(ValueError):
-        _mk_state(trusted_price=1.0)
-
-def test_invalid_no_price(): # req 18
-    with pytest.raises(ValueError):
-        _mk_state(verification_state=VerificationState.INVALID,
-                  trusted_price=1.0)
-
-def test_conflict_needs_two(): # req 19
-    with pytest.raises(ValueError):
-        ConflictRecord(instrument="EURUSD", conflicting_fields=("close",),
-                       observations=(("prov-a", "100.0"),),
-                       detected_at_utc=_now())
-    with pytest.raises(ValueError):
-        ConflictRecord(instrument="EURUSD", conflicting_fields=(),
-                       observations=(("a", "1"), ("b", "2")),
-                       detected_at_utc=_now())
-
-def test_conflict_no_price(): # req 20
-    s = _mk_state(verification_state=VerificationState.DATA_CONFLICT,
-                  quality_state=QualityState.DEGRADED,
-                  sources=("prov-a", "prov-b"), conflicts=(_mk_conflict(),),
-                  freshness_seconds=1.0)
-    assert s.trusted_price is None and len(s.conflicts) == 1
-
-def test_abstract_blocked(): # req 21
-    with pytest.raises(TypeError):
-        MarketDataProvider()
-
-def test_interchangeable(): # req 22
-    a, b = MockProvider("prov-a", 2680.50), MockProvider("prov-b", 2680.50)
-    ra = a.get_source_records("XAUUSD", "M5")[0]
-    rb = b.get_source_records("XAUUSD", "M5")[0]
-    assert ra.candle.close == rb.candle.close
-    s = _mk_state(instrument="XAUUSD", trusted_price=ra.candle.close,
-                  price_source="median", sources=("prov-a", "prov-b"),
-                  verification_state=VerificationState.VERIFIED,
-                  quality_state=QualityState.NOMINAL, freshness_seconds=0.5)
-    assert s.verification_state is VerificationState.VERIFIED
-
-def test_conversions(): # req 23
-    p = MockProvider("prov-a", 1.0)
-    assert p.to_howza_instrument(p.to_provider_symbol("XAUUSD")) == "XAUUSD"
-    assert p.to_howza_timeframe(p.to_provider_timeframe("M5")) == "M5"
-    assert p.source_id_for("XAUUSD", "M5") == "prov-a:XAUUSD:M5"
-    recs = p.get_source_records("XAUUSD", "M5", limit=3)
-    assert isinstance(recs, tuple) and len(recs) == 3
-    assert all(isinstance(r, SourceRecord) for r in recs)
-
-def test_health_error(): # req 24
-    p = MockProvider("prov-a", 1.0)
-    h = p.health()
-    assert h.status is ProviderHealthStatus.UP
-    assert h.provider_id == "prov-a" and h.detail == ""
-    e = ProviderError("prov-a", "TIMEOUT", "slow")
-    assert e.code == "TIMEOUT" and e.provider_id == "prov-a"
-    assert "TIMEOUT" in str(e)
-
-def test_no_network_no_secrets(): # req 25
-    import howza_market_data as m
-    src = inspect.getsource(m).lower()
-    for token in ("socket", "urllib", "requests", "http://", "https://",
-                  "api_key", "password", "subprocess", "place_order"):
-        assert token not in src, token
+    def supports_instrument(self, howza_instrument: str) -> bool:
+        return howza_instrument in SUPPORTED_INSTRUMENTS
