@@ -38,6 +38,8 @@ jobs:
 
       - name: Phase 1B verifier
         working-directory: phase1b
+        env:
+          PYTHONPATH: ../phase1a-execution
         run: python run_phase1b.py
 
       - name: Upload Phase 1B evidence
