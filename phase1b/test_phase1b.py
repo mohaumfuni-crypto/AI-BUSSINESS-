@@ -181,3 +181,102 @@ def test_fixture_source_record_has_valid_schema():
     assert result["passed"] is True
     assert result["missing"] == []
     assert result["candle_missing"] == []
+
+
+def test_fixture_health_is_up():
+    provider = FixtureProvider()
+    health = provider.health()
+
+    assert health.provider_id == provider.provider_id
+    assert health.status == m1a.ProviderHealthStatus.UP
+
+
+def test_check_frozen_interfaces_passes():
+    result = check_frozen_interfaces()
+
+    assert result["passed"] is True
+    assert result["details"]["MarketDataProvider"] is True
+    assert result["details"]["trust_lifecycle"] is True
+
+
+def test_stale_fixture_is_untrusted():
+    provider = FixtureProvider()
+
+    evaluated_at = (
+        REFERENCE_EVALUATION_TIME
+        + timedelta(seconds=POLICY_STALE_PLUS_ONE)
+    )
+
+    result = trust_snapshot(
+        provider,
+        "XAUUSD",
+        "1m",
+        evaluated_at=evaluated_at,
+    )
+
+    assert result["status"] == UNTRUSTED
+
+
+def test_aging_fixture_is_degraded():
+    provider = FixtureProvider()
+
+    evaluated_at = (
+        REFERENCE_EVALUATION_TIME
+        + timedelta(seconds=POLICY_AGING_PLUS_ONE)
+    )
+
+    result = trust_snapshot(
+        provider,
+        "XAUUSD",
+        "1m",
+        evaluated_at=evaluated_at,
+    )
+
+    assert result["status"] == DEGRADED
+
+
+def test_future_timestamp_is_untrusted():
+    provider = FixtureProvider()
+
+    evaluated_at = (
+        REFERENCE_EVALUATION_TIME
+        - timedelta(seconds=1)
+    )
+
+    result = trust_snapshot(
+        provider,
+        "XAUUSD",
+        "1m",
+        evaluated_at=evaluated_at,
+    )
+
+    assert result["status"] == UNTRUSTED
+
+
+def test_unsupported_instrument_is_untrusted():
+    provider = FixtureProvider()
+
+    result = fresh_snapshot(
+        provider=provider,
+        instrument="NOT_REAL",
+        timeframe="1m",
+    )
+
+    assert result["status"] == UNTRUSTED
+
+
+def test_lifecycle_is_categorical_only():
+    result = trust_lifecycle()
+
+    assert result["categorical_only"] is True
+    assert result["numeric_trust_score"] is False
+
+
+def test_fixture_source_id_is_stable():
+    provider = FixtureProvider()
+
+    first = provider.source_id_for("XAUUSD", "1m")
+    second = provider.source_id_for("XAUUSD", "1m")
+
+    assert first == second
+    assert first == "phase1b-fixture:XAUUSD:1m"
