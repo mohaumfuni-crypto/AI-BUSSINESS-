@@ -8,6 +8,7 @@ Usage: python run_phase1a.py
 from __future__ import annotations
 
 import ast
+import importlib.util
 import io
 import json
 import subprocess
@@ -75,7 +76,6 @@ def execution_probe() -> dict:
     offline and returns a lifecycle dict."""
     result = {"passed": False, "checks": {}}
     try:
-        importlib.util
         spec = importlib.util.spec_from_file_location(
             "howza_market_data", TARGET)
         module = importlib.util.module_from_spec(spec)
