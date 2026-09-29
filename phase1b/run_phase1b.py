@@ -1,4 +1,4 @@
-"""Phase 1B verifier: gates -> pytest (18 tests) -> phase1b_evidence.json.
+"""HOWZA Phase 1B behavioural and contract tests."""
 
 Exit 0 only if: static audit passes, all 18 tests pass, evidence written.
 Run as a script: python run_phase1b.py (from the phase1b directory).
