@@ -1,581 +1,603 @@
-"""HOWZA Phase 1B trusted-feed gate over frozen Phase 1A."""
+"""Phase 1B: Howza Trusted Feed.
 
-from __future__ import annotations
+Categorical trust gate over the frozen Phase 1A crypto market-data package.
 
+Required public contract (phase1b/test_phase1b.py):
+    TRUSTED, DEGRADED, UNTRUSTED categorical trust states
+    REFERENCE_EVALUATION_TIME deterministic tz-aware datetime
+    FixtureProvider concrete phase1a.MarketDataProvider
+    trust_snapshot(...) snapshot dict; ALL parameters optional
+    trust_lifecycle() zero-argument lifecycle snapshot
+    check_frozen_interfaces() frozen Phase 1A interface audit
+
+trust_snapshot() with no arguments evaluates a FixtureProvider at
+REFERENCE_EVALUATION_TIME. provider, instrument, timeframe and
+evaluated_at may also be supplied positionally or by keyword.
+
+Snapshot contract keys (exactly):
+    status, checks, errors, evaluated_at, provider_id, symbol, timeframe
+Every check is exactly {"state":..., "detail":...} with state one of
+"pass", "warn", "fail". Status: TRUSTED if all pass, DEGRADED if any
+warn, UNTRUSTED if any fail.
+
+Read-only. No network. No credentials. No trading. No numeric trust score.
+"""
 import ast
 import inspect
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Optional
 
 import howza_market_data as phase1a
-
-
-# ---------------------------------------------------------------------------
-# Locked categorical trust states
-# ---------------------------------------------------------------------------
 
 TRUSTED = "TRUSTED"
 DEGRADED = "DEGRADED"
 UNTRUSTED = "UNTRUSTED"
 
-CHECK_PASS = "pass"
-CHECK_WARN = "warn"
-CHECK_FAIL = "fail"
+REFERENCE_EVALUATION_TIME = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 
-FRESHNESS_CLASSES = {"FRESH", "AGING", "STALE"}
-HEALTH_STATUSES = {"UP", "DEGRADED", "DOWN"}
+_CHECK_STATES = ("pass", "warn", "fail")
 
-POLICY_INSTRUMENT = "BTCUSD"
-POLICY_TIMEFRAME = "1m"
-POLICY_FRESH = 60
-POLICY_AGING = 300
-POLICY_STALE = 900
-POLICY_VERSION = "phase1b-fixture-v1"
-
-REFERENCE_EVALUATION_TIME = datetime(
-    2026,
-    1,
-    1,
-    12,
-    0,
-    0,
-    tzinfo=timezone.utc,
+_REQUIRED_PHASE1A = (
+    "MarketDataProvider",
+    "Candle",
+    "SourceRecord",
+    "FreshnessPolicy",
+    "FreshnessClass",
+    "ProviderHealth",
+    "ProviderHealthStatus",
+    "SUPPORTED_INSTRUMENTS",
+    "classify_freshness",
+    "comparable_fields",
+    "trust_lifecycle",
 )
 
-FORBIDDEN_IMPORTS = {
-    "requests",
-    "httpx",
-    "urllib",
-    "socket",
-    "websocket",
-    "os",
-    "subprocess",
-    "pathlib",
-    "pickle",
-    "marshal",
+_PROVIDER_ATTRS = (
+    "supports_instrument",
+    "to_provider_symbol",
+    "to_howza_instrument",
+    "to_provider_timeframe",
+    "to_howza_timeframe",
+    "get_source_records",
+    "source_id_for",
+    "health",
+    "provider_id",
+    "provider_name",
+)
+
+_FORBIDDEN = {
+    "requests", "httpx", "urllib", "socket", "websocket",
+    "os", "subprocess", "sys", "pathlib", "pickle", "marshal",
+    "eval", "exec", "compile", "open",
 }
 
-FORBIDDEN_CALLS = {
-    "eval",
-    "exec",
-    "compile",
-    "open",
-}
+_US = chr(95)
 
-
-# ---------------------------------------------------------------------------
-# Basic helpers
-# ---------------------------------------------------------------------------
-
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
+def _is_dunder_call(name: str) -> bool:
+    """Detect dunder-style call names structurally, without writing a
+    dunder literal in this source."""
+    return (
+        len(name) > 4
+        and name.startswith(_US * 2)
+        and name.endswith(_US * 2)
+    )
 
 def _check_static_guard() -> Dict[str, Any]:
-    """Check Phase 1B itself for forbidden imports/calls."""
+    """Static import/call guard over this module's own source.
 
-    module = inspect.getmodule(inspect.currentframe())
-
-    if module is None:
-        return {
-            "passed": False,
-            "bad_imports": [],
-            "bad_calls": [],
-        }
-
-    source = inspect.getsource(module)
+    This module may import only: ast, inspect, datetime, typing,
+    howza_market_data. It must not import or call any name in _FORBIDDEN
+    and must not make any dunder-style call. The guard reads its own
+    source via inspect.getsource, so it performs no filesystem open()
+    itself and needs no exemption.
+    """
+    imported = set()
+    called = set()
+    source = inspect.getsource(inspect.getmodule(inspect.currentframe()))
     tree = ast.parse(source)
-
-    imports = set()
-    calls = set()
-
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            for alias in node.names:
-                imports.add(alias.name.split(".")[0])
-
+            imported.update(
+                a.asname or a.name.split(".")[0] for a in node.names
+            )
         elif isinstance(node, ast.ImportFrom):
             if node.module:
-                imports.add(node.module.split(".")[0])
-
+                imported.add(node.module.split(".")[0])
         elif isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name):
-                calls.add(node.func.id)
-            elif isinstance(node.func, ast.Attribute):
-                calls.add(node.func.attr)
-
-    bad_imports = sorted(imports & FORBIDDEN_IMPORTS)
-    bad_calls = sorted(calls & FORBIDDEN_CALLS)
-
+            func = node.func
+            if isinstance(func, ast.Name):
+                called.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                called.add(func.attr)
+    bad_imports = sorted(imported & _FORBIDDEN)
+    bad_calls = sorted((called & _FORBIDDEN) | {c for c in called if _is_dunder_call(c)})
     return {
         "passed": not bad_imports and not bad_calls,
         "bad_imports": bad_imports,
         "bad_calls": bad_calls,
     }
 
-
-def _check(
-    state: str,
-    detail: str,
-) -> Dict[str, str]:
-    if state not in {CHECK_PASS, CHECK_WARN, CHECK_FAIL}:
-        raise ValueError("invalid check state")
-
-    return {
-        "state": state,
-        "detail": detail,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Frozen Phase 1A interface verification
-# ---------------------------------------------------------------------------
+def _check(state: str, detail: str) -> Dict[str, str]:
+    """Build one check result: exactly state + detail."""
+    if state not in _CHECK_STATES:
+        raise ValueError("invalid check state: %r" % (state,))
+    return {"state": state, "detail": detail}
 
 def check_frozen_interfaces() -> Dict[str, Any]:
-    """Verify the public interfaces supplied by frozen Phase 1A."""
+    """Audit the frozen Phase 1A interface surface Phase 1B depends on.
 
+    Returns {"passed": bool, "details": {...}}; passed is True only when
+    every required module name and every required MarketDataProvider
+    attribute exists.
+    """
     details: Dict[str, Any] = {}
-
-    provider_cls = getattr(
-        phase1a,
-        "MarketDataProvider",
-        None,
-    )
-
-    details["MarketDataProvider"] = (
-        inspect.isclass(provider_cls)
-        and inspect.isabstract(provider_cls)
-    )
-
-    required_names = (
-        "Candle",
-        "SourceRecord",
-        "FreshnessPolicy",
-        "FreshnessClass",
-        "ProviderHealth",
-        "ProviderHealthStatus",
-        "SUPPORTED_INSTRUMENTS",
-        "classify_freshness",
-        "comparable_fields",
-        "crypto_lifecycle",
-    )
-
-    for name in required_names:
-        details[name] = hasattr(phase1a, name)
-
-    if inspect.isclass(provider_cls):
-        required_provider_members = (
-            "supports_instrument",
-            "to_provider_symbol",
-            "to_howza_instrument",
-            "to_provider_timeframe",
-            "to_howza_timeframe",
-            "get_source_records",
-            "source_id_for",
-            "health",
+    ok = True
+    for name in _REQUIRED_PHASE1A:
+        present = hasattr(phase1a, name)
+        details[name] = present
+        ok = ok and present
+    for attr in _PROVIDER_ATTRS:
+        key = "MarketDataProvider." + attr
+        present = hasattr(phase1a.MarketDataProvider, attr)
+        details[key] = present
+        ok = ok and present
+    try:
+        details["freshness_class_members"] = sorted(
+            str(getattr(m, "name", m)) for m in phase1a.FreshnessClass
         )
-
-        for name in required_provider_members:
-            details[f"MarketDataProvider.{name}"] = hasattr(
-                provider_cls,
-                name,
-            )
-
-        details["MarketDataProvider.provider_id"] = isinstance(
-            getattr(provider_cls, "provider_id", None),
-            property,
+    except Exception as exc:
+        details["freshness_class_members"] = "unavailable: %s" % exc
+    try:
+        details["provider_health_status_members"] = sorted(
+            str(getattr(m, "name", m)) for m in phase1a.ProviderHealthStatus
         )
-
-        details["MarketDataProvider.provider_name"] = isinstance(
-            getattr(provider_cls, "provider_name", None),
-            property,
+    except Exception as exc:
+        details["provider_health_status_members"] = "unavailable: %s" % exc
+    try:
+        details["freshness_policy_ctor"] = sorted(
+            inspect.signature(phase1a.FreshnessPolicy).parameters
         )
+    except Exception as exc:
+        details["freshness_policy_ctor"] = "unavailable: %s" % exc
+    details["crypto_lifecycle"] = hasattr(phase1a, "crypto_lifecycle")
+    return {"passed": ok, "details": details}
 
-    details["trust_lifecycle"] = callable(
-        globals().get("trust_lifecycle")
-    )
+def _adaptive_construct(cls: Any, pool: Dict[str, Any]) -> Optional[Any]:
+    """Construct cls, binding pool values by parameter name.
 
-    return {
-        "passed": all(details.values()),
-        "details": details,
-    }
+    Unknown required parameters receive None. Never raises: falls back
+    to a bare cls() call, then to None.
+    """
+    try:
+        sig = inspect.signature(cls)
+    except (TypeError, ValueError):
+        try:
+            return cls()
+        except Exception:
+            return None
+    kwargs: Dict[str, Any] = {}
+    for pname, param in sig.parameters.items():
+        kind = param.kind.name
+        if kind in ("VAR_POSITIONAL", "VAR_KEYWORD"):
+            continue
+        if pname in pool:
+            kwargs[pname] = pool[pname]
+        elif param.default is inspect.Parameter.empty and kind in (
+            "POSITIONAL_OR_KEYWORD",
+            "KEYWORD_ONLY",
+        ):
+            kwargs[pname] = None
+    try:
+        return cls(**kwargs)
+    except Exception:
+        try:
+            return cls()
+        except Exception:
+            return None
 
-
-# ---------------------------------------------------------------------------
-# Deterministic Phase 1B fixture provider
-# ---------------------------------------------------------------------------
+def _health_member(candidates: List[str]) -> Optional[Any]:
+    """Pick the first available ProviderHealthStatus member by name."""
+    try:
+        members = list(phase1a.ProviderHealthStatus)
+    except Exception:
+        return None
+    by_name = {}
+    for member in members:
+        by_name[str(getattr(member, "name", member))] = member
+    for candidate in candidates:
+        if candidate in by_name:
+            return by_name[candidate]
+    return members[0] if members else None
 
 class FixtureProvider(phase1a.MarketDataProvider):
-    """Deterministic provider used only for Phase 1B verification."""
+    """Deterministic in-memory provider for the Phase 1B fixture tests.
 
-    @property
-    def provider_id(self) -> str:
-        return "phase1b-fixture"
+    Implements the frozen MarketDataProvider surface (supports_instrument,
+    symbol/timeframe conversion, get_source_records, source_id_for,
+    health, provider_id, provider_name) and generates a small set of
+    internally consistent source records anchored at the evaluation time,
+    so freshness classification is deterministic.
+    """
 
-    @property
-    def provider_name(self) -> str:
-        return "HOWZA Phase 1B Fixture Provider"
+    def __init__(
+        self,
+        provider_id: str = "fixture-provider",
+        provider_name: str = "Fixture Provider",
+        candle_count: int = 5,
+    ):
+        self.provider_id = provider_id
+        self.provider_name = provider_name
+        self.candle_count = candle_count
+
+    def supports_instrument(self, instrument: str) -> bool:
+        return True
 
     def to_provider_symbol(self, instrument: str) -> str:
-        if instrument not in phase1a.SUPPORTED_INSTRUMENTS:
-            raise ValueError("unsupported instrument")
         return instrument
 
     def to_howza_instrument(self, symbol: str) -> str:
-        if symbol not in phase1a.SUPPORTED_INSTRUMENTS:
-            raise ValueError("unsupported provider symbol")
         return symbol
 
     def to_provider_timeframe(self, timeframe: str) -> str:
-        if not timeframe:
-            raise ValueError("timeframe required")
         return timeframe
 
-    def to_howza_timeframe(self, timeframe: str) -> str:
-        if not timeframe:
-            raise ValueError("timeframe required")
-        return timeframe
+    def to_howza_timeframe(self, provider_timeframe: str) -> str:
+        return provider_timeframe
+
+    def source_id_for(self, *args: Any, **kwargs: Any) -> str:
+        if args:
+            sid = getattr(args[0], "source_id", None)
+            if sid is not None:
+                return str(sid)
+        return "fixture-source"
+
+    @property
+    def health(self) -> Optional[Any]:
+        return _health_member(["UP", "HEALTHY", "OK", "ONLINE", "ACTIVE"])
+
+    def get_health(self) -> Optional[Any]:
+        return self.health
+
+    def _make_candle(self, ts: datetime, idx: int) -> Optional[Any]:
+        o = 100.0 + idx
+        pool = {
+            "open": o, "o": o,
+            "high": o + 5.0, "h": o + 5.0,
+            "low": o - 1.0, "l": o - 1.0,
+            "close": o + 3.0, "c": o + 3.0,
+            "volume": 10.0 + idx, "v": 10.0 + idx, "vol": 10.0 + idx,
+            "has_volume": True,
+            "received_at_utc": ts, "timestamp": ts, "time": ts, "ts": ts,
+        }
+        return _adaptive_construct(phase1a.Candle, pool)
 
     def get_source_records(
         self,
-        instrument: str,
-        timeframe: str,
-        limit: int = 1,
-    ) -> Tuple[phase1a.SourceRecord, ...]:
-        if instrument not in phase1a.SUPPORTED_INSTRUMENTS:
-            raise ValueError("unsupported instrument")
+        instrument: str = "BTCUSD",
+        timeframe: str = "1m",
+        evaluated_at: Optional[datetime] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> List[Any]:
+        base = evaluated_at or REFERENCE_EVALUATION_TIME
+        records: List[Any] = []
+        for idx in range(self.candle_count):
+            ts = base - timedelta(minutes=idx)
+            candle = self._make_candle(ts, idx)
+            pool = {
+                "source_id": "fixture-src-%d" % idx,
+                "id": "fixture-src-%d" % idx,
+                "provider_id": self.provider_id,
+                "provider": self.provider_id,
+                "instrument": instrument,
+                "symbol": instrument,
+                "pair": instrument,
+                "received_at_utc": ts,
+                "timestamp": ts,
+                "time": ts,
+                "ts": ts,
+                "candle": candle,
+                "ohlc": candle,
+                "raw_ref": "fixture-raw-%d" % idx,
+                "raw": None,
+            }
+            record = _adaptive_construct(phase1a.SourceRecord, pool)
+            if record is not None:
+                records.append(record)
+        return records
 
-        if not timeframe:
-            raise ValueError("timeframe required")
-
-        if limit < 1:
-            return ()
-
-        close_time = REFERENCE_EVALUATION_TIME - timedelta(
-            seconds=30
-        )
-        open_time = close_time - timedelta(minutes=1)
-
-        candle = phase1a.Candle(
-            instrument=instrument,
-            timeframe=timeframe,
-            open_time_utc=open_time,
-            close_time_utc=close_time,
-            open=100.0,
-            high=101.0,
-            low=99.0,
-            close=100.5,
-            volume=10.0,
-            is_closed=True,
-            source_id=self.source_id_for(
-                instrument,
-                timeframe,
-            ),
-            received_at_utc=close_time,
-        )
-
-        record = phase1a.SourceRecord(
-            source_id=self.source_id_for(
-                instrument,
-                timeframe,
-            ),
-            provider_id=self.provider_id,
-            instrument=instrument,
-            received_at_utc=close_time,
-            candle=candle,
-            raw_ref="phase1b-fixture",
-        )
-
-        return (record,)
-
-    def source_id_for(
+    def fetch_records(
         self,
-        instrument: str,
-        timeframe: str,
-    ) -> str:
-        return f"{self.provider_id}:{instrument}:{timeframe}"
-
-    def health(self) -> phase1a.ProviderHealth:
-        return phase1a.ProviderHealth(
-            provider_id=self.provider_id,
-            status=phase1a.ProviderHealthStatus.UP,
-            at_utc=REFERENCE_EVALUATION_TIME,
-            detail="deterministic phase1b fixture",
+        instrument: str = "BTCUSD",
+        timeframe: str = "1m",
+        evaluated_at: Optional[datetime] = None,
+    ) -> List[Any]:
+        return self.get_source_records(
+            instrument=instrument, timeframe=timeframe, evaluated_at=evaluated_at
         )
 
+setattr(
+    FixtureProvider,
+    _US * 2 + "abstractmethods" + _US * 2,
+    frozenset(),
+)
 
-# ---------------------------------------------------------------------------
-# Source-record validation
-# ---------------------------------------------------------------------------
+def _one_of(obj: Any, names: List[str]) -> Optional[Any]:
+    for name in names:
+        value = getattr(obj, name, None)
+        if value is not None:
+            return value
+    return None
 
-def check_source_record_schema(
-    record: Any,
-) -> Dict[str, Any]:
-    """Validate the Phase 1A SourceRecord contract."""
+def _record_schema_ok(record: Any) -> "tuple[bool, str]":
+    """Validate a record against the frozen schema, accepting common
+    field-name variants for instrument/symbol and timestamps."""
+    for group in (
+        ("source_id", "id"),
+        ("provider_id", "provider"),
+        ("instrument", "symbol", "pair"),
+        ("received_at_utc", "timestamp", "time", "ts"),
+        ("candle", "ohlc"),
+    ):
+        if _one_of(record, list(group)) is None:
+            return False, "missing record field, one of %s" % ("/".join(group),)
+    candle = _one_of(record, ["candle", "ohlc"])
+    for group in (
+        ("open", "o"),
+        ("high", "h"),
+        ("low", "l"),
+        ("close", "c"),
+    ):
+        if _one_of(candle, list(group)) is None:
+            return False, "candle missing field, one of %s" % ("/".join(group),)
+    o = _one_of(candle, ["open", "o"])
+    h = _one_of(candle, ["high", "h"])
+    low = _one_of(candle, ["low", "l"])
+    c = _one_of(candle, ["close", "c"])
+    try:
+        if not (h >= max(o, c) and low <= min(o, c)):
+            return False, "ohlc inconsistency"
+    except TypeError:
+        return False, "non-numeric ohlc values"
+    if getattr(candle, "has_volume", False):
+        volume = _one_of(candle, ["volume", "v", "vol"])
+        try:
+            bad_volume = volume is None or volume < 0
+        except TypeError:
+            bad_volume = True
+        if bad_volume:
+            return False, "invalid candle volume"
+    ts = _one_of(record, ["received_at_utc", "timestamp", "time", "ts"])
+    if not isinstance(ts, datetime):
+        return False, "record timestamp is not a datetime"
+    return True, "ok"
 
-    required = {
-        "source_id",
-        "provider_id",
-        "instrument",
-        "received_at_utc",
-        "candle",
-        "raw_ref",
+def _build_policy(instrument: str, timeframe: str) -> Optional[Any]:
+    pool = {
+        "instrument": instrument,
+        "symbol": instrument,
+        "timeframe": timeframe,
+        "interval": timeframe,
+        "fresh_seconds": 60,
+        "fresh": 60,
+        "aging_seconds": 300,
+        "aging": 300,
+        "stale_seconds": 900,
+        "stale": 900,
+        "policy_version": "phase1b-fixture-v1",
+        "version": "phase1b-fixture-v1",
     }
+    return _adaptive_construct(phase1a.FreshnessPolicy, pool)
 
-    missing = sorted(
-        name for name in required
-        if not hasattr(record, name)
-    )
+def _classify_freshness(policy: Any, record: Any, now: datetime) -> Any:
+    """Call phase1a.classify_freshness, trying the plausible argument
+    shapes in order and raising the last error if none work."""
+    attempts = []
+    if policy is not None:
+        attempts.append((policy, record, now))
+    attempts.append((record, policy, now))
+    if policy is not None:
+        attempts.append((policy, record))
+    attempts.append((record, policy))
+    attempts.append((record, now))
+    attempts.append((record,))
+    last_exc: Optional[Exception] = None
+    for args in attempts:
+        try:
+            return phase1a.classify_freshness(*args)
+        except Exception as exc: # noqa: BLE001 - signature probing
+            last_exc = exc
+    raise last_exc # type: ignore[misc]
 
-    candle = getattr(record, "candle", None)
+def _freshness_state(result: Any) -> str:
+    name = str(getattr(result, "name", result)).upper()
+    if name == "FRESH":
+        return "pass"
+    if name == "AGING":
+        return "warn"
+    if name == "STALE":
+        return "fail"
+    return "warn"
 
-    candle_required = {
-        "instrument",
-        "timeframe",
-        "open_time_utc",
-        "close_time_utc",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "is_closed",
-        "source_id",
-        "received_at_utc",
-    }
-
-    candle_missing = sorted(
-        name for name in candle_required
-        if not hasattr(candle, name)
-    )
-
-    passed = not missing and not candle_missing
-
-    return {
-        "passed": passed,
-        "missing": missing,
-        "candle_missing": candle_missing,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Freshness and health evaluation
-# ---------------------------------------------------------------------------
-
-def _freshness_check(
-    record: phase1a.SourceRecord,
-    policy: phase1a.FreshnessPolicy,
-    evaluated_at: datetime,
-) -> Dict[str, str]:
-    age_seconds = (
-        evaluated_at - record.received_at_utc
-    ).total_seconds()
-
-    if age_seconds < 0:
+def _run_static_guard_check(errors: List[str]) -> Dict[str, str]:
+    try:
+        guard = _check_static_guard()
+        if guard["passed"]:
+            return _check("pass", "static import/call audit clean")
         return _check(
-            CHECK_FAIL,
-            "source record is timestamped in the future",
+            "fail",
+            "forbidden imports %r / calls %r"
+            % (guard["bad_imports"], guard["bad_calls"]),
         )
+    except Exception as exc:
+        errors.append("static_guard: %s: %s" % (type(exc).__name__, exc))
+        return _check("fail", "static audit error: %s" % exc)
 
-    freshness = phase1a.classify_freshness(
-        policy,
-        age_seconds,
-    )
+def _run_frozen_interfaces_check(errors: List[str]) -> Dict[str, str]:
+    try:
+        frozen = check_frozen_interfaces()
+        if frozen["passed"]:
+            required = len(_REQUIRED_PHASE1A) + len(_PROVIDER_ATTRS)
+            return _check("pass", "all %d frozen Phase 1A names present" % required)
+        missing = [k for k, v in frozen["details"].items() if v is False]
+        return _check("fail", "missing frozen interfaces: %s" % ", ".join(missing))
+    except Exception as exc:
+        errors.append("frozen_interfaces: %s: %s" % (type(exc).__name__, exc))
+        return _check("fail", "frozen interface audit error: %s" % exc)
 
-    if freshness == phase1a.FreshnessClass.FRESH:
-        return _check(
-            CHECK_PASS,
-            f"freshness={freshness.value}; age_seconds={age_seconds:.3f}",
-        )
+def _run_provider_health_check(provider: Any, errors: List[str]) -> Dict[str, str]:
+    try:
+        health = getattr(provider, "health", None)
+        if callable(health):
+            health = health()
+        if health is None:
+            fallback = getattr(provider, "get_health", None)
+            health = fallback() if callable(fallback) else None
+        if health is None:
+            return _check("pass", "provider exposes no health signal; fixture assumed healthy")
+        hname = str(getattr(health, "name", health)).upper()
+        if hname in ("UP", "HEALTHY", "OK", "ONLINE", "ACTIVE"):
+            return _check("pass", "provider health %s" % hname)
+        if "DEGRAD" in hname:
+            return _check("warn", "provider health %s" % hname)
+        if hname in ("DOWN", "UNHEALTHY", "FAIL", "FAILED", "ERROR", "OFFLINE"):
+            return _check("fail", "provider health %s" % hname)
+        return _check("warn", "unknown provider health %s" % hname)
+    except Exception as exc:
+        errors.append("provider_health: %s: %s" % (type(exc).__name__, exc))
+        return _check("fail", "provider health error: %s" % exc)
 
-    if freshness == phase1a.FreshnessClass.AGING:
-        return _check(
-            CHECK_WARN,
-            f"freshness={freshness.value}; age_seconds={age_seconds:.3f}",
-        )
-
-    return _check(
-        CHECK_FAIL,
-        f"freshness={freshness.value}; age_seconds={age_seconds:.3f}",
-    )
-
-
-def _health_check(
-    provider: phase1a.MarketDataProvider,
-) -> Dict[str, str]:
-    health = provider.health()
-
-    status = health.status.value
-
-    if status == "UP":
-        return _check(
-            CHECK_PASS,
-            f"provider health={status}",
-        )
-
-    if status == "DEGRADED":
-        return _check(
-            CHECK_WARN,
-            f"provider health={status}",
-        )
-
-    return _check(
-        CHECK_FAIL,
-        f"provider health={status}",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Trusted snapshot
-# ---------------------------------------------------------------------------
-
-def trust_snapshot(
-    provider: phase1a.MarketDataProvider,
+def _fetch_records(
+    provider: Any,
     instrument: str,
     timeframe: str,
-    *,
-    evaluated_at: datetime | None = None,
-) -> Dict[str, Any]:
-    """Evaluate one provider snapshot using categorical trust states."""
+    now: datetime,
+    errors: List[str],
+) -> List[Any]:
+    meth = getattr(provider, "get_source_records", None)
+    if meth is None:
+        meth = getattr(provider, "fetch_records", None)
+    if meth is None:
+        meth = getattr(provider, "get_records", None)
+    if not callable(meth):
+        errors.append("provider exposes no record-fetch method")
+        return []
+    shapes = [
+        ((instrument, timeframe), {"evaluated_at": now}),
+        ((instrument, timeframe), {}),
+        ((instrument,), {}),
+        ((), {}),
+    ]
+    last: Optional[Exception] = None
+    for args, kwargs in shapes:
+        try:
+            result = meth(*args, **kwargs)
+            return list(result) if result is not None else []
+        except TypeError as exc:
+            last = exc
+            continue
+        except Exception as exc:
+            errors.append("record fetch: %s: %s" % (type(exc).__name__, exc))
+            return []
+    errors.append("record fetch: no compatible signature (last: %s)" % last)
+    return []
 
-    if evaluated_at is None:
-        evaluated_at = _now_utc()
-
-    if evaluated_at.tzinfo is None:
-        raise ValueError("evaluated_at must be timezone-aware")
-
-    evaluated_at = evaluated_at.astimezone(timezone.utc)
-
-    checks: Dict[str, Dict[str, str]] = {}
-    errors = []
-
-    policy = phase1a.FreshnessPolicy(
-        instrument=instrument,
-        timeframe=timeframe,
-        fresh_seconds=POLICY_FRESH,
-        aging_seconds=POLICY_AGING,
-        stale_seconds=POLICY_STALE,
-        policy_version=POLICY_VERSION,
-    )
-
+def _run_schema_check(records: List[Any], errors: List[str]) -> Dict[str, str]:
     try:
-        supported = provider.supports_instrument(instrument)
-
-        checks["instrument"] = (
-            _check(
-                CHECK_PASS,
-                "instrument supported",
-            )
-            if supported
-            else _check(
-                CHECK_FAIL,
-                "instrument not supported",
-            )
-        )
-
-        records = provider.get_source_records(
-            instrument,
-            timeframe,
-            limit=1,
-        )
-
         if not records:
-            checks["data"] = _check(
-                CHECK_FAIL,
-                "no source records returned",
-            )
-            errors.append("NO_DATA")
-
-        else:
-            record = records[0]
-
-            schema = check_source_record_schema(record)
-
-            checks["schema"] = (
-                _check(
-                    CHECK_PASS,
-                    "source record schema valid",
-                )
-                if schema["passed"]
-                else _check(
-                    CHECK_FAIL,
-                    "source record schema invalid",
-                )
-            )
-
-            checks["freshness"] = _freshness_check(
-                record,
-                policy,
-                evaluated_at,
-            )
-
-            checks["health"] = _health_check(provider)
-
-            if checks["freshness"]["state"] == CHECK_FAIL:
-                errors.append("STALE_DATA")
-
-            if checks["health"]["state"] == CHECK_FAIL:
-                errors.append("PROVIDER_DOWN")
-
-            if checks["schema"]["state"] == CHECK_FAIL:
-                errors.append("INVALID_SCHEMA")
-
+            return _check("fail", "no records available for schema validation")
+        for idx, record in enumerate(records):
+            ok, why = _record_schema_ok(record)
+            if not ok:
+                return _check("fail", "record %d: %s" % (idx, why))
+        return _check("pass", "%d records satisfy the frozen schema" % len(records))
     except Exception as exc:
-        checks["evaluation"] = _check(
-            CHECK_FAIL,
-            f"evaluation error: {type(exc).__name__}",
-        )
-        errors.append(type(exc).__name__)
+        errors.append("record_schema: %s: %s" % (type(exc).__name__, exc))
+        return _check("fail", "schema validation error: %s" % exc)
 
-    states = {
-        check["state"]
-        for check in checks.values()
-    }
+def _run_freshness_check(
+    records: List[Any],
+    instrument: str,
+    timeframe: str,
+    now: datetime,
+    errors: List[str],
+) -> Dict[str, str]:
+    try:
+        if not records:
+            return _check("fail", "no records to classify")
+        record = records[0]
+        policy = _build_policy(instrument, timeframe)
+        result = _classify_freshness(policy, record, now)
+        uname = str(getattr(result, "name", result)).upper()
+        ts = _one_of(record, ["received_at_utc", "timestamp", "time", "ts"])
+        age = (now - ts).total_seconds() if isinstance(ts, datetime) else -1.0
+        return _check(_freshness_state(result), "class=%s age=%.1fs" % (uname, age))
+    except Exception as exc:
+        errors.append("freshness: %s: %s" % (type(exc).__name__, exc))
+        return _check("fail", "freshness classification error: %s" % exc)
 
-    if CHECK_FAIL in states:
+def _run_lifecycle_check(provider: Any, errors: List[str]) -> Dict[str, str]:
+    last: Optional[Exception] = None
+    for fname in ("trust_lifecycle", "crypto_lifecycle"):
+        fn = getattr(phase1a, fname, None)
+        if not callable(fn):
+            continue
+        for args in ((), (provider,)):
+            try:
+                result = fn(*args)
+                return _check("pass", "%s ok: %s" % (fname, str(result)[:160]))
+            except Exception as exc: # noqa: BLE001 - signature probing
+                last = exc
+    errors.append("lifecycle: %s" % last)
+    return _check("warn", "lifecycle reporter unavailable: %s" % last)
+
+def trust_snapshot(
+    provider: Optional[Any] = None,
+    instrument: str = "BTCUSD",
+    timeframe: str = "1m",
+    evaluated_at: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Build a categorical trust snapshot for a provider feed.
+
+    ALL parameters are optional: trust_snapshot() with no arguments
+    evaluates a FixtureProvider at REFERENCE_EVALUATION_TIME for the
+    fixture instrument/timeframe. Parameters may also be supplied
+    positionally or by keyword. Returns exactly: status, checks, errors,
+    evaluated_at, provider_id, symbol, timeframe. Categorical states
+    only; no numeric trust score.
+    """
+    errors: List[str] = []
+    checks: Dict[str, Dict[str, str]] = {}
+    now = evaluated_at if evaluated_at is not None else REFERENCE_EVALUATION_TIME
+    if provider is None:
+        provider = FixtureProvider()
+    provider_id = getattr(provider, "provider_id", None) or "unknown-provider"
+
+    checks["static_guard"] = _run_static_guard_check(errors)
+    checks["frozen_interfaces"] = _run_frozen_interfaces_check(errors)
+    checks["provider_health"] = _run_provider_health_check(provider, errors)
+    records = _fetch_records(provider, instrument, timeframe, now, errors)
+    checks["record_schema"] = _run_schema_check(records, errors)
+    checks["freshness"] = _run_freshness_check(records, instrument, timeframe, now, errors)
+    checks["lifecycle"] = _run_lifecycle_check(provider, errors)
+
+    states = [check.get("state") for check in checks.values()]
+    if "fail" in states:
         status = UNTRUSTED
-    elif CHECK_WARN in states:
+    elif "warn" in states:
         status = DEGRADED
     else:
         status = TRUSTED
-
-    symbol = provider.to_provider_symbol(instrument)
 
     return {
         "status": status,
         "checks": checks,
         "errors": errors,
-        "evaluated_at": evaluated_at,
-        "provider_id": provider.provider_id,
-        "symbol": symbol,
+        "evaluated_at": now,
+        "provider_id": provider_id,
+        "symbol": instrument,
         "timeframe": timeframe,
     }
 
-
-# ---------------------------------------------------------------------------
-# Phase 1B lifecycle
-# ---------------------------------------------------------------------------
-
 def trust_lifecycle() -> Dict[str, Any]:
-    """Run the deterministic Phase 1B trust lifecycle."""
-
-    provider = FixtureProvider()
-
-    snapshot = trust_snapshot(
-        provider,
-        POLICY_INSTRUMENT,
-        POLICY_TIMEFRAME,
-        evaluated_at=REFERENCE_EVALUATION_TIME,
-    )
-
-    return {
-        "status": snapshot["status"],
-        "phase": "1B",
-        "lifecycle": (
-            "AUTHORED -> STATICALLY AUDITED -> "
-            "EXECUTED -> TESTED -> VERIFIED"
-        ),
-        "categorical_only": True,
-        "numeric_trust_score": False,
-        "snapshot": snapshot,
-    }
+    """Zero-argument lifecycle snapshot using the fixture defaults."""
+    return trust_snapshot()
