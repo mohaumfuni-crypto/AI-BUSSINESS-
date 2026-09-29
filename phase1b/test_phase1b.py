@@ -1,4 +1,4 @@
-"""HOWZA Phase 1B behavioural and contract tests."""
+⁶"""HOWZA Phase 1B behavioural and contract tests."""
 
 from __future__ import annotations
 
@@ -280,3 +280,27 @@ def test_fixture_source_id_is_stable():
 
     assert first == second
     assert first == "phase1b-fixture:XAUUSD:1m"
+def test_lifecycle_reports_phase_1b():
+    result = trust_lifecycle()
+    assert result["phase"] == "1B"
+
+
+def test_lifecycle_contains_required_lifecycle_string():
+    result = trust_lifecycle()
+    assert result["lifecycle"] == (
+        "AUTHORED -> STATICALLY AUDITED -> "
+        "EXECUTED -> TESTED -> VERIFIED"
+    )
+
+
+def test_snapshot_identifies_fixture_provider():
+    result = fresh_snapshot()
+    assert result["provider_id"] == "phase1b-fixture"
+    assert result["symbol"] == "XAUUSD"
+    assert result["timeframe"] == "1m"
+
+
+def test_snapshot_evaluation_time_is_utc():
+    result = fresh_snapshot()
+    assert result["evaluated_at"].tzinfo is not None
+    assert result["evaluated_at"].utcoffset() == timedelta(0)
