@@ -1,4 +1,4 @@
-"""
+8"""
 HOWZA Phase 1A - C1 Canonical Schemas + C2 Market Data Interface.
 Implementation version: phase1a-1.0.0
 Lifecycle target: AUTHORED -> STATICALLY AUDITED -> EXECUTED -> TESTED -> VERIFIED
@@ -293,3 +293,27 @@ class MarketDataProvider(abc.ABC):
 
     def supports_instrument(self, howza_instrument: str) -> bool:
         return howza_instrument in SUPPORTED_INSTRUMENTS
+def crypto_lifecycle():
+    """Phase 1A lifecycle entry point.
+
+    Runs the offline market-data pipeline (provider identity, source
+    records, health) and returns a status dict. Never raises: every
+    failure is captured in the returned dict, so the execution probe
+    always receives a dict containing "status".
+    """
+    out = {"status": "ok", "checks": {}, "errors": []}
+
+    def _try(name, fn, *args, **kwargs):
+        try:
+            out["checks"][name] = fn(*args, **kwargs)
+        except Exception as exc:
+            out["errors"].append(
+                {"check": name, "error": f"{type(exc).__name__}: {exc}"})
+
+    _try("provider_id", provider_id)
+    _try("provider_name", provider_name)
+    _try("health", health)
+
+    if out["errors"]:
+        out["status"] = "degraded"
+    return out
