@@ -11,12 +11,16 @@ import ast
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import traceback
 from datetime import datetime, timezone
 
-TARGET = "howza_market_data.py"
+BASE = os.path.dirname(os.path.abspath(__file__))
+TARGET = os.path.join(BASE, "howza_market_data.py")
+TEST_FILE = os.path.join(BASE, "test_phase1a.py")
+EVIDENCE_PATH = os.path.join(BASE, "phase1a_evidence.json")
 
 def static_audit() -> dict:
     """Static checks: parseable, no forbidden imports, no network, no
@@ -102,8 +106,8 @@ def run_pytest() -> dict:
     """Run the pytest suite; capture pass/fail counts."""
     result = {"passed": False}
     proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "test_phase1a.py", "-q"],
-        capture_output=True, text=True, cwd=".")
+        [sys.executable, "-m", "pytest", TEST_FILE, "-q"],
+        capture_output=True, text=True, cwd=BASE)
     result["returncode"] = proc.returncode
     result["stdout_tail"] = proc.stdout.strip().splitlines()[-8:]
     result["stderr_tail"] = proc.stderr.strip().splitlines()[-8:] \
@@ -124,11 +128,10 @@ def main() -> None:
              "pytest": evidence["pytest"]["passed"]}
     evidence["gates"] = gates
     evidence["verdict"] = "VERIFIED" if all(gates.values()) else "NOT_VERIFIED"
-    out_path = "phase1a_evidence.json"
-    with open(out_path, "w", encoding="utf-8") as fh:
+    with open(EVIDENCE_PATH, "w", encoding="utf-8") as fh:
         json.dump(evidence, fh, indent=2)
-    summary = {"verdict": evidence["verdict"], "evidence_file": out_path,
-               "gates": gates}
+    summary = {"verdict": evidence["verdict"],
+               "evidence_file": EVIDENCE_PATH, "gates": gates}
     print(json.dumps(summary, indent=2))
     sys.exit(0 if evidence["verdict"] == "VERIFIED" else 1)
 
