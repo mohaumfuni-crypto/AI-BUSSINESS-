@@ -244,4 +244,4 @@ def check_frozen_interfaces() -> Dict[str, Any]:
     except Exception:
         policy_ok = False
 
-    details["freshness_policy_ctor"] =
+    details["freshness_policy_ctor"] = policy_ok
