@@ -116,4 +116,14 @@ def _check_static_guard() -> Dict[str, Any]:
     }
 
 
-def _check
+def _check(
+    state: str,
+    detail: str,
+) -> Dict[str, str]:
+    if state not in {CHECK_PASS, CHECK_WARN, CHECK_FAIL}:
+        raise ValueError("invalid check state")
+
+    return {
+        "state": state,
+        "detail": detail,
+}
