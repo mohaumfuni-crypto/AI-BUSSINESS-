@@ -6,17 +6,13 @@ import pytest
 
 import howza_trusted_feed as tf
 from howza_market_data import (
-    Candle,
     FreshnessClass,
     FreshnessPolicy,
     MarketDataProvider,
     ProviderHealth,
     ProviderHealthStatus,
-    SourceRecord,
     SUPPORTED_INSTRUMENTS,
     classify_freshness,
-    comparable_fields,
-    crypto_lifecycle,
 )
 
 
@@ -128,4 +124,32 @@ def test_freshness_policy_classifies_stale_data():
         fresh_seconds=60,
         aging_seconds=300,
         stale_seconds=900,
-        policy_version="phase1b-fi
+        policy_version="phase1b-fixture-v1",
+    )
+    assert classify_freshness(policy, 901) is FreshnessClass.STALE
+
+
+def test_lifecycle_reports_phase_1b():
+    result = tf.trust_lifecycle()
+    assert result["phase"] == "1B"
+
+
+def test_lifecycle_contains_required_lifecycle_string():
+    result = tf.trust_lifecycle()
+    assert result["lifecycle"] == (
+        "AUTHORED -> STATICALLY AUDITED -> "
+        "EXECUTED -> TESTED -> VERIFIED"
+    )
+
+
+def test_snapshot_identifies_fixture_provider():
+    result = tf.trust_snapshot()
+    assert result["provider_id"] == "phase1b-fixture"
+    assert result["symbol"] == "XAUUSD"
+    assert result["timeframe"] == "1m"
+
+
+def test_snapshot_evaluation_time_is_utc():
+    result = tf.trust_snapshot()
+    assert result["evaluated_at"].tzinfo is not None
+    assert result["evaluated_at"].utcoffset() == timedelta(0)
