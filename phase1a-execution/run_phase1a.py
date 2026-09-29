@@ -3,18 +3,27 @@
 Runs the static audit, the execution probe, and the pytest suite for
 howza_market_data.py, then writes phase1a_evidence.json.
 
+Phase 1A requirements enforced:
+    - offline-only (no network imports allowed)
+    - no dangerous calls (eval/exec/system/subprocess spawns/...)
+    - "crypto_lifecycle" function must exist
+    - execution probe: module must import cleanly and crypto_lifecycle()
+    must return a dict containing "status"
+    - pytest suite (test_phase1a.py) must pass
+    - evidence JSON written; verdict is VERIFIED only if ALL gates pass
+
 Usage: python run_phase1a.py
 """
 from __future__ import annotations
 
 import ast
-import importlib.util
-import io
 import json
 import os
+import re
 import subprocess
 import sys
 import traceback
+import types
 from datetime import datetime, timezone
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -75,28 +84,56 @@ def static_audit() -> dict:
         and result["checks"]["lifecycle_present"])
     return result
 
+def _load_module_offline(name: str, path: str) -> types.ModuleType:
+    """Load a.py file as a module WITHOUT the importlib loader machinery.
+
+    Compiles the source and executes it in a fresh module namespace.
+    This avoids the `spec.loader is None` / `exec_module` AttributeError
+    class of failures entirely. The module is registered in sys.modules
+    during execution (so dataclasses, typing, etc. behave normally) and
+    removed afterwards to keep the probe side-effect free.
+    """
+    with open(path, "r", encoding="utf-8") as fh:
+        source = fh.read()
+    code = compile(source, path, "exec")
+    module = types.ModuleType(name)
+    module.__file__ = path
+    sys.modules[name] = module
+    try:
+        exec(code, module.__dict__)
+    finally:
+        sys.modules.pop(name, None)
+    return module
+
 def execution_probe() -> dict:
     """Actually execute the module and crypto_lifecycle; confirm it runs
     offline and returns a lifecycle dict."""
     result = {"passed": False, "checks": {}}
     try:
-        spec = importlib.util.spec_from_file_location(
-            "howza_market_data", TARGET)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = _load_module_offline("howza_market_data", TARGET)
         result["checks"]["module_executes"] = True
     except Exception:
         result["checks"]["module_executes"] = False
         result["error"] = traceback.format_exc()
         return result
 
+    lifecycle_fn = getattr(module, "crypto_lifecycle", None)
+    if not callable(lifecycle_fn):
+        result["checks"]["lifecycle_callable"] = False
+        result["error"] = "crypto_lifecycle is missing or not callable"
+        return result
+
     try:
-        lifecycle = module.crypto_lifecycle()
+        lifecycle = lifecycle_fn()
         ok = isinstance(lifecycle, dict) and "status" in lifecycle
         result["checks"]["lifecycle_returns_dict_with_status"] = ok
         result["checks"]["lifecycle_keys"] = sorted(lifecycle.keys()) \
             if isinstance(lifecycle, dict) else []
         result["passed"] = ok
+        if not ok:
+            result["error"] = (
+                "crypto_lifecycle() must return a dict containing "
+                f"'status'; got: {type(lifecycle).__name__}")
     except Exception:
         result["checks"]["lifecycle_callable"] = False
         result["error"] = traceback.format_exc()
@@ -104,7 +141,7 @@ def execution_probe() -> dict:
 
 def run_pytest() -> dict:
     """Run the pytest suite; capture pass/fail counts."""
-    result = {"passed": False}
+    result = {"passed": False, "tests_collected": None}
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", TEST_FILE, "-q"],
         capture_output=True, text=True, cwd=BASE)
@@ -112,6 +149,9 @@ def run_pytest() -> dict:
     result["stdout_tail"] = proc.stdout.strip().splitlines()[-8:]
     result["stderr_tail"] = proc.stderr.strip().splitlines()[-8:] \
         if proc.stderr.strip() else []
+    match = re.search(r"(\d+)\s+passed", proc.stdout)
+    if match:
+        result["tests_collected"] = int(match.group(1))
     result["passed"] = proc.returncode == 0
     return result
 
