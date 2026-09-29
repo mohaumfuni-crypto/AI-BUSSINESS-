@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-# Make frozen Phase 1A and Phase 1B modules importable from the repository root.
 ROOT = Path(__file__).resolve().parents[1]
 PHASE1A_DIR = ROOT / "phase1a-execution"
 
@@ -26,14 +25,12 @@ from howza_trusted_feed import (
     UNTRUSTED,
     FixtureProvider,
     REFERENCE_EVALUATION_TIME,
+    check_frozen_interfaces,
+    check_source_record_schema,
     trust_lifecycle,
     trust_snapshot,
 )
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def fresh_snapshot(
     provider=None,
@@ -50,10 +47,6 @@ def fresh_snapshot(
         evaluated_at=REFERENCE_EVALUATION_TIME,
     )
 
-
-# ---------------------------------------------------------------------------
-# 1. All frozen Phase 1A names bind with the required kinds.
-# ---------------------------------------------------------------------------
 
 def test_phase1a_names_bind_with_required_kinds():
     provider_cls = m1a.MarketDataProvider
@@ -80,9 +73,7 @@ def test_phase1a_names_bind_with_required_kinds():
         "source_id_for",
         "health",
     ):
-        assert callable(
-            inspect.getattr_static(provider_cls, name)
-        )
+        assert callable(inspect.getattr_static(provider_cls, name))
 
     for name in (
         "classify_freshness",
@@ -103,18 +94,10 @@ def test_phase1a_names_bind_with_required_kinds():
         assert getattr(m1a, name, None) is not None
 
 
-# ---------------------------------------------------------------------------
-# 2. Direct construction of the frozen ABC must fail.
-# ---------------------------------------------------------------------------
-
 def test_direct_market_data_provider_construction_fails():
     with pytest.raises(TypeError):
         m1a.MarketDataProvider()
 
-
-# ---------------------------------------------------------------------------
-# 3. Fixture provider is a valid concrete Phase 1A provider.
-# ---------------------------------------------------------------------------
 
 def test_fixture_provider_is_valid_market_data_provider():
     provider = FixtureProvider()
@@ -123,10 +106,6 @@ def test_fixture_provider_is_valid_market_data_provider():
     assert provider.provider_id
     assert provider.provider_name
 
-
-# ---------------------------------------------------------------------------
-# 4. trust_lifecycle() is a zero-argument deterministic entry point.
-# ---------------------------------------------------------------------------
 
 def test_trust_lifecycle_zero_argument_returns_valid_dict():
     result = trust_lifecycle()
@@ -138,10 +117,6 @@ def test_trust_lifecycle_zero_argument_returns_valid_dict():
         UNTRUSTED,
     }
 
-
-# ---------------------------------------------------------------------------
-# 5. Snapshot contains exactly the locked public keys.
-# ---------------------------------------------------------------------------
 
 def test_snapshot_contains_exact_required_keys():
     result = fresh_snapshot()
@@ -157,10 +132,6 @@ def test_snapshot_contains_exact_required_keys():
     }
 
 
-# ---------------------------------------------------------------------------
-# 6. Every check has exactly state + detail.
-# ---------------------------------------------------------------------------
-
 def test_every_check_has_valid_state_and_detail():
     result = fresh_snapshot()
 
@@ -168,20 +139,45 @@ def test_every_check_has_valid_state_and_detail():
 
     for check_name, check in result["checks"].items():
         assert isinstance(check_name, str)
-        assert set(check.keys()) == {
-            "state",
-            "detail",
-        }
-        assert check["state"] in {
-            "pass",
-            "warn",
-            "fail",
-        }
+        assert set(check.keys()) == {"state", "detail"}
+        assert check["state"] in {"pass", "warn", "fail"}
         assert isinstance(check["detail"], str)
 
 
-# ---------------------------------------------------------------------------
-# 7. Healthy fixture + fresh data -> TRUSTED.
-# ---------------------------------------------------------------------------
+def test_healthy_fresh_fixture_is_trusted():
+    result = fresh_snapshot()
 
-def test_healthy_fresh_fixture_is_tr
+    assert result["status"] == TRUSTED
+    assert result["errors"] == []
+
+
+def test_fixture_symbol_mapping_is_deterministic():
+    provider = FixtureProvider()
+
+    assert provider.to_provider_symbol("XAUUSD") == "XAUUSD"
+    assert provider.to_howza_instrument("XAUUSD") == "XAUUSD"
+
+
+def test_fixture_timeframe_mapping_is_deterministic():
+    provider = FixtureProvider()
+
+    assert provider.to_provider_timeframe("1m") == "1m"
+    assert provider.to_howza_timeframe("1m") == "1m"
+
+
+def test_fixture_source_record_has_valid_schema():
+    provider = FixtureProvider()
+
+    records = provider.get_source_records(
+        "XAUUSD",
+        "1m",
+        limit=1,
+    )
+
+    assert len(records) == 1
+
+    result = check_source_record_schema(records[0])
+
+    assert result["passed"] is True
+    assert result["missing"] == []
+    assert result["candle_missing"] == []
