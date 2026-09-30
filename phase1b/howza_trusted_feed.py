@@ -81,8 +81,6 @@ _FIXTURE_INSTRUMENT = "XAUUSD"
 _FIXTURE_TIMEFRAME = "1m"
 
 def _is_dunder_call(name: str) -> bool:
-    """Detect dunder-style call names structurally, without writing a
-    dunder literal in this source."""
     return (
         len(name) > 4
         and name.startswith(_US * 2)
@@ -90,14 +88,6 @@ def _is_dunder_call(name: str) -> bool:
     )
 
 def _check_static_guard() -> Dict[str, Any]:
-    """Static import/call guard over this module's own source.
-
-    This module may import only: ast, inspect, datetime, typing,
-    howza_market_data. It must not import or call any name in _FORBIDDEN
-    and must not make any dunder-style call. The guard reads its own
-    source via inspect.getsource, so it performs no filesystem open()
-    itself and needs no exemption.
-    """
     imported = set()
     called = set()
     source = inspect.getsource(inspect.getmodule(inspect.currentframe()))
@@ -125,19 +115,11 @@ def _check_static_guard() -> Dict[str, Any]:
     }
 
 def _check(state: str, detail: str) -> Dict[str, str]:
-    """Build one check result: exactly state + detail."""
     if state not in _CHECK_STATES:
         raise ValueError("invalid check state: %r" % (state,))
     return {"state": state, "detail": detail}
 
 def check_frozen_interfaces() -> Dict[str, Any]:
-    """Audit the frozen interfaces Phase 1B depends on and must expose.
-
-    Verifies every required frozen Phase 1A name, every required
-    MarketDataProvider attribute, and that this module itself exposes a
-    callable module-level trust_lifecycle as the Phase 1B public contract
-    requires. Returns {"passed": bool, "details": {...}}.
-    """
     details: Dict[str, Any] = {}
     ok = True
     for name in _REQUIRED_PHASE1A:
@@ -174,11 +156,6 @@ def check_frozen_interfaces() -> Dict[str, Any]:
     return {"passed": ok, "details": details}
 
 def _adaptive_construct(cls: Any, pool: Dict[str, Any]) -> Optional[Any]:
-    """Construct cls, binding pool values by parameter name.
-
-    Unknown required parameters receive None. Never raises: falls back
-    to a bare cls() call, then to None.
-    """
     try:
         sig = inspect.signature(cls)
     except (TypeError, ValueError):
@@ -207,7 +184,6 @@ def _adaptive_construct(cls: Any, pool: Dict[str, Any]) -> Optional[Any]:
             return None
 
 def _health_member(candidates: List[str]) -> Optional[Any]:
-    """Pick the first available ProviderHealthStatus member by name."""
     try:
         members = list(phase1a.ProviderHealthStatus)
     except Exception:
@@ -221,11 +197,6 @@ def _health_member(candidates: List[str]) -> Optional[Any]:
     return members[0] if members else None
 
 def _make_provider_health(provider_id: str) -> Any:
-    """Build a healthy phase1a.ProviderHealth instance.
-
-    Returns a real ProviderHealth (satisfying isinstance checks), falling
-    back to the bare status member only if construction is impossible.
-    """
     status = _health_member(["UP", "HEALTHY", "OK", "ONLINE", "ACTIVE"])
     now = datetime.now(timezone.utc)
     pool = {
@@ -261,7 +232,6 @@ def _make_provider_health(provider_id: str) -> Any:
     return result
 
 def _health_status_of(health: Any) -> Any:
-    """Extract the ProviderHealthStatus member from a health report."""
     if health is None:
         return None
     if hasattr(health, "name"):
@@ -273,14 +243,7 @@ def _health_status_of(health: Any) -> Any:
     return health
 
 class FixtureProvider(phase1a.MarketDataProvider):
-    """Deterministic in-memory provider for the Phase 1B fixture tests.
-
-    Implements the frozen MarketDataProvider surface. provider_id and
-    provider_name are read-only properties returning the fixture identity
-    ("phase1b-fixture"); health() is a callable method returning a healthy
-    phase1a.ProviderHealth instance. Generates a small set of internally
-    consistent source records anchored at the evaluation time.
-    """
+    """Deterministic in-memory provider for the Phase 1B fixture tests."""
 
     @property
     def provider_id(self) -> str:
@@ -299,9 +262,6 @@ class FixtureProvider(phase1a.MarketDataProvider):
         provider_name: Optional[str] = None,
         candle_count: int = 5,
     ):
-        # provider_id / provider_name are read-only properties: the frozen
-        # base forbids assignment and the fixture identity is fixed.
-        # Accepted here only for call compatibility; values are ignored.
         self.candle_count = candle_count
 
     def supports_instrument(self, instrument: str) -> bool:
@@ -412,8 +372,6 @@ def _one_of(obj: Any, names: List[str]) -> Optional[Any]:
     return None
 
 def _record_schema_ok(record: Any) -> "tuple[bool, str]":
-    """Validate a record against the frozen schema, accepting common
-    field-name variants for identifiers, instruments and timestamps."""
     for group in (
         ("source_id", "id", "record_id"),
         ("provider_id", "provider", "exchange", "exchange_id", "source"),
@@ -479,11 +437,6 @@ def _build_policy(instrument: str, timeframe: str) -> Optional[Any]:
 
 def _bind_freshness_args(sig: Any, policy: Any, record: Any,
                          now: datetime) -> Optional[Any]:
-    """Bind (policy, record, now) to classify_freshness parameters by name.
-
-    Returns (args, kwargs) or None when a required parameter cannot be
-    matched to one of the three values.
-    """
     args: List[Any] = []
     kwargs: Dict[str, Any] = {}
     for pname, param in sig.parameters.items():
@@ -517,11 +470,6 @@ def _bind_freshness_args(sig: Any, policy: Any, record: Any,
     return args, kwargs
 
 def _classify_freshness(policy: Any, record: Any, now: datetime) -> Any:
-    """Call phase1a.classify_freshness.
-
-    First binds arguments semantically from the real signature; falls back
-    to positional shape probing. Raises the last error if nothing works.
-    """
     fn = phase1a.classify_freshness
     try:
         sig = inspect.signature(fn)
@@ -534,7 +482,7 @@ def _classify_freshness(policy: Any, record: Any, now: datetime) -> Any:
             try:
                 return fn(*args, **kwargs)
             except Exception:
-                pass # fall through to positional probing
+                pass
     attempts = []
     if policy is not None:
         attempts.append((policy, record, now))
@@ -548,9 +496,9 @@ def _classify_freshness(policy: Any, record: Any, now: datetime) -> Any:
     for args in attempts:
         try:
             return fn(*args)
-        except Exception as exc: # noqa: BLE001 - signature probing
+        except Exception as exc:
             last_exc = exc
-    raise last_exc # type: ignore[misc]
+    raise last_exc
 
 def _freshness_state(result: Any) -> str:
     name = str(getattr(result, "name", result)).upper()
@@ -563,73 +511,7 @@ def _freshness_state(result: Any) -> str:
     return "warn"
 
 def _call_phase1a_lifecycle(provider: Any = None) -> Any:
-    """Call the frozen Phase 1A lifecycle reporter, probing signatures."""
     last_exc: Optional[Exception] = None
     for fname in ("crypto_lifecycle", "trust_lifecycle"):
         fn = getattr(phase1a, fname, None)
         if not callable(fn):
-            continue
-        arg_sets = [()] if provider is None else [(), (provider,)]
-        for args in arg_sets:
-            try:
-                return fn(*args)
-            except Exception as exc: # noqa: BLE001 - signature probing
-                last_exc = exc
-    raise last_exc if last_exc is not None else RuntimeError("no lifecycle reporter")
-
-def _phase1a_lifecycle_string() -> str:
-    """Return the lifecycle string from the frozen Phase 1A report.
-
-    crypto_lifecycle() returns a dict like {'status': 'ok', 'phase': '1A',
-    'lifecycle': '<string>'}; this extracts the lifecycle string.
-    """
-    try:
-        result = _call_phase1a_lifecycle()
-    except Exception:
-        return "unknown"
-    if isinstance(result, str):
-        return result
-    if isinstance(result, dict):
-        val = result.get("lifecycle")
-        if isinstance(val, str):
-            return val
-        for key in ("name", "id", "value"):
-            alt = result.get(key)
-            if isinstance(alt, str):
-                return alt
-    if result is None:
-        return "unknown"
-    return str(result)
-
-def _run_static_guard_check(errors: List[str]) -> Dict[str, str]:
-    try:
-        guard = _check_static_guard()
-        if guard["passed"]:
-            return _check("pass", "static import/call audit clean")
-        return _check(
-            "fail",
-            "forbidden imports %r / calls %r"
-            % (guard["bad_imports"], guard["bad_calls"]),
-        )
-    except Exception as exc:
-        errors.append("static_guard: %s: %s" % (type(exc).__name__, exc))
-        return _check("fail", "static audit error: %s" % exc)
-
-def _run_frozen_interfaces_check(errors: List[str]) -> Dict[str, str]:
-    try:
-        frozen = check_frozen_interfaces()
-        if frozen["passed"]:
-            required = len(_REQUIRED_PHASE1A) + len(_PROVIDER_ATTRS) + 1
-            return _check("pass", "all %d frozen interfaces present" % required)
-        missing = [k for k, v in frozen["details"].items() if v is False]
-        return _check("fail", "missing frozen interfaces: %s" % ", ".join(missing))
-    except Exception as exc:
-        errors.append("frozen_interfaces: %s: %s" % (type(exc).__name__, exc))
-        return _check("fail", "frozen interface audit error: %s" % exc)
-
-def _run_provider_health_check(provider: Any, errors: List[str]) -> Dict[str, str]:
-    try:
-        health = getattr(provider, "health", None)
-        if callable(health):
-            health = health()
-        if health
