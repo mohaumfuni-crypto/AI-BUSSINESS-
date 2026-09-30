@@ -7,24 +7,21 @@ Required public contract (phase1b/test_phase1b.py):
     REFERENCE_EVALUATION_TIME deterministic tz-aware datetime
     FixtureProvider concrete phase1a.MarketDataProvider
     trust_snapshot(...) snapshot dict; ALL parameters optional
-    trust_lifecycle() zero-argument lifecycle snapshot
+    trust_lifecycle() zero-argument lifecycle dict
     check_frozen_interfaces() frozen Phase 1A interface audit
 
 trust_snapshot() with no arguments evaluates a FixtureProvider at
-REFERENCE_EVALUATION_TIME. provider, instrument, timeframe and
-evaluated_at may also be supplied positionally or by keyword.
+REFERENCE_EVALUATION_TIME. The snapshot exposes overall_state (the
+categorical verdict) plus status, checks, errors, evaluated_at,
+provider_id, symbol, timeframe.
 
-FixtureProvider conforms exactly to the frozen MarketDataProvider
-contract: provider_id, provider_name and health are read-only
-properties on the frozen base, so FixtureProvider overrides them as
-read-only properties and never assigns to them. FixtureProvider()
-instantiates with no arguments.
+trust_lifecycle() returns {"phase": "1B", "lifecycle": <raw frozen Phase 1A
+crypto_lifecycle() value>} merged with the snapshot fields.
 
-Snapshot contract keys (exactly):
-    status, checks, errors, evaluated_at, provider_id, symbol, timeframe
-Every check is exactly {"state":..., "detail":...} with state one of
-"pass", "warn", "fail". Status: TRUSTED if all pass, DEGRADED if any
-warn, UNTRUSTED if any fail.
+FixtureProvider conforms to the frozen MarketDataProvider contract:
+provider_id/provider_name are read-only properties returning the fixture
+identity ("phase1b-fixture"); health() is a callable method returning the
+healthy ProviderHealthStatus member.
 
 Read-only. No network. No credentials. No trading. No numeric trust score.
 """
@@ -76,6 +73,9 @@ _FORBIDDEN = {
 }
 
 _US = chr(95)
+
+_FIXTURE_PROVIDER_ID = "phase1b-fixture"
+_FIXTURE_PROVIDER_NAME = "Phase 1B Fixture Provider"
 
 def _is_dunder_call(name: str) -> bool:
     """Detect dunder-style call names structurally, without writing a
@@ -220,25 +220,22 @@ def _health_member(candidates: List[str]) -> Optional[Any]:
 class FixtureProvider(phase1a.MarketDataProvider):
     """Deterministic in-memory provider for the Phase 1B fixture tests.
 
-    Implements the frozen MarketDataProvider surface (supports_instrument,
-    symbol/timeframe conversion, get_source_records, source_id_for,
-    health, provider_id, provider_name). The frozen base defines
-    provider_id, provider_name (and health) as read-only properties, so
-    this class overrides them as read-only properties and never assigns
-    to them. Generates a small set of internally consistent source
-    records anchored at the evaluation time, so freshness classification
-    is deterministic.
+    Implements the frozen MarketDataProvider surface. provider_id and
+    provider_name are read-only properties returning the fixture identity
+    ("phase1b-fixture"); health() is a callable method returning the
+    healthy ProviderHealthStatus member. Generates a small set of
+    internally consistent source records anchored at the evaluation time,
+    so freshness classification is deterministic.
     """
 
     @property
     def provider_id(self) -> str:
-        return "fixture-provider"
+        return _FIXTURE_PROVIDER_ID
 
     @property
     def provider_name(self) -> str:
-        return "Fixture Provider"
+        return _FIXTURE_PROVIDER_NAME
 
-    @property
     def health(self) -> Optional[Any]:
         return _health_member(["UP", "HEALTHY", "OK", "ONLINE", "ACTIVE"])
 
@@ -248,10 +245,9 @@ class FixtureProvider(phase1a.MarketDataProvider):
         provider_name: Optional[str] = None,
         candle_count: int = 5,
     ):
-        # provider_id / provider_name are read-only properties on the
-        # frozen base: assignment would raise AttributeError, and the
-        # property always returns the fixture identity. Accepted here
-        # only for call compatibility; values are ignored.
+        # provider_id / provider_name are read-only properties: the frozen
+        # base forbids assignment and the fixture identity is fixed.
+        # Accepted here only for call compatibility; values are ignored.
         self.candle_count = candle_count
 
     def supports_instrument(self, instrument: str) -> bool:
@@ -274,10 +270,10 @@ class FixtureProvider(phase1a.MarketDataProvider):
             sid = getattr(args[0], "source_id", None)
             if sid is not None:
                 return str(sid)
-        return "fixture-source"
+        return "phase1b-fixture-source"
 
     def get_health(self) -> Optional[Any]:
-        return self.health
+        return self.health()
 
     def _make_candle(self, ts: datetime, idx: int) -> Optional[Any]:
         o = 100.0 + idx
@@ -287,8 +283,10 @@ class FixtureProvider(phase1a.MarketDataProvider):
             "low": o - 1.0, "l": o - 1.0,
             "close": o + 3.0, "c": o + 3.0,
             "volume": 10.0 + idx, "v": 10.0 + idx, "vol": 10.0 + idx,
+            "base_volume": 10.0 + idx, "quote_volume": 1000.0 + idx,
             "has_volume": True,
-            "received_at_utc": ts, "timestamp": ts, "time": ts, "ts": ts,
+            "received_at_utc": ts, "received_at": ts,
+            "timestamp": ts, "time": ts, "ts": ts, "event_time": ts,
         }
         return _adaptive_construct(phase1a.Candle, pool)
 
@@ -306,20 +304,29 @@ class FixtureProvider(phase1a.MarketDataProvider):
             ts = base - timedelta(minutes=idx)
             candle = self._make_candle(ts, idx)
             pool = {
-                "source_id": "fixture-src-%d" % idx,
-                "id": "fixture-src-%d" % idx,
+                "source_id": "phase1b-src-%d" % idx,
+                "id": "phase1b-src-%d" % idx,
+                "record_id": "phase1b-src-%d" % idx,
                 "provider_id": self.provider_id,
                 "provider": self.provider_id,
+                "exchange": self.provider_id,
+                "exchange_id": self.provider_id,
                 "instrument": instrument,
                 "symbol": instrument,
                 "pair": instrument,
+                "market": instrument,
+                "trading_pair": instrument,
                 "received_at_utc": ts,
+                "received_at": ts,
                 "timestamp": ts,
                 "time": ts,
                 "ts": ts,
+                "event_time": ts,
+                "created_at": ts,
                 "candle": candle,
                 "ohlc": candle,
-                "raw_ref": "fixture-raw-%d" % idx,
+                "kline": candle,
+                "raw_ref": "phase1b-raw-%d" % idx,
                 "raw": None,
             }
             record = _adaptive_construct(phase1a.SourceRecord, pool)
@@ -352,17 +359,18 @@ def _one_of(obj: Any, names: List[str]) -> Optional[Any]:
 
 def _record_schema_ok(record: Any) -> "tuple[bool, str]":
     """Validate a record against the frozen schema, accepting common
-    field-name variants for instrument/symbol and timestamps."""
+    field-name variants for identifiers, instruments and timestamps."""
     for group in (
-        ("source_id", "id"),
-        ("provider_id", "provider"),
-        ("instrument", "symbol", "pair"),
-        ("received_at_utc", "timestamp", "time", "ts"),
-        ("candle", "ohlc"),
+        ("source_id", "id", "record_id"),
+        ("provider_id", "provider", "exchange", "exchange_id", "source"),
+        ("instrument", "symbol", "pair", "market", "trading_pair"),
+        ("received_at_utc", "received_at", "timestamp", "time", "ts",
+         "event_time", "created_at"),
+        ("candle", "ohlc", "kline"),
     ):
         if _one_of(record, list(group)) is None:
             return False, "missing record field, one of %s" % ("/".join(group),)
-    candle = _one_of(record, ["candle", "ohlc"])
+    candle = _one_of(record, ["candle", "ohlc", "kline"])
     for group in (
         ("open", "o"),
         ("high", "h"),
@@ -381,14 +389,16 @@ def _record_schema_ok(record: Any) -> "tuple[bool, str]":
     except TypeError:
         return False, "non-numeric ohlc values"
     if getattr(candle, "has_volume", False):
-        volume = _one_of(candle, ["volume", "v", "vol"])
+        volume = _one_of(candle, ["volume", "v", "vol", "base_volume",
+                                  "quote_volume"])
         try:
-            bad_volume = volume is None or volume < 0
+            bad_volume = volume is not None and volume < 0
         except TypeError:
-            bad_volume = True
+            bad_volume = False
         if bad_volume:
-            return False, "invalid candle volume"
-    ts = _one_of(record, ["received_at_utc", "timestamp", "time", "ts"])
+            return False, "negative candle volume"
+    ts = _one_of(record, ["received_at_utc", "received_at", "timestamp",
+                          "time", "ts", "event_time", "created_at"])
     if not isinstance(ts, datetime):
         return False, "record timestamp is not a datetime"
     return True, "ok"
@@ -401,18 +411,76 @@ def _build_policy(instrument: str, timeframe: str) -> Optional[Any]:
         "interval": timeframe,
         "fresh_seconds": 60,
         "fresh": 60,
+        "max_fresh_age": 60,
+        "max_age": 60,
         "aging_seconds": 300,
         "aging": 300,
         "stale_seconds": 900,
         "stale": 900,
+        "max_stale_age": 900,
         "policy_version": "phase1b-fixture-v1",
         "version": "phase1b-fixture-v1",
     }
     return _adaptive_construct(phase1a.FreshnessPolicy, pool)
 
+def _bind_freshness_args(sig: Any, policy: Any, record: Any,
+                         now: datetime) -> Optional[Any]:
+    """Bind (policy, record, now) to classify_freshness parameters by name.
+
+    Returns (args, kwargs) or None when a required parameter cannot be
+    matched to one of the three values.
+    """
+    args: List[Any] = []
+    kwargs: Dict[str, Any] = {}
+    for pname, param in sig.parameters.items():
+        kind = param.kind.name
+        if kind in ("VAR_POSITIONAL", "VAR_KEYWORD"):
+            continue
+        lower = pname.lower()
+        value: Any = None
+        matched = True
+        if "record" in lower or "candle" in lower or "kline" in lower:
+            value = record
+        elif "polic" in lower:
+            if policy is None:
+                matched = False
+            else:
+                value = policy
+        elif lower in ("now", "as_of", "asof", "at", "at_time",
+                       "evaluated_at", "evaluation_time", "current_time",
+                       "timestamp", "ts", "time", "when"):
+            value = now
+        elif param.default is not inspect.Parameter.empty:
+            continue
+        else:
+            matched = False
+        if not matched:
+            return None
+        if kind == "POSITIONAL_ONLY":
+            args.append(value)
+        else:
+            kwargs[pname] = value
+    return args, kwargs
+
 def _classify_freshness(policy: Any, record: Any, now: datetime) -> Any:
-    """Call phase1a.classify_freshness, trying the plausible argument
-    shapes in order and raising the last error if none work."""
+    """Call phase1a.classify_freshness.
+
+    First binds arguments semantically from the real signature; falls back
+    to positional shape probing. Raises the last error if nothing works.
+    """
+    fn = phase1a.classify_freshness
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        sig = None
+    if sig is not None:
+        bound = _bind_freshness_args(sig, policy, record, now)
+        if bound is not None:
+            args, kwargs = bound
+            try:
+                return fn(*args, **kwargs)
+            except Exception:
+                pass # fall through to positional probing
     attempts = []
     if policy is not None:
         attempts.append((policy, record, now))
@@ -425,7 +493,7 @@ def _classify_freshness(policy: Any, record: Any, now: datetime) -> Any:
     last_exc: Optional[Exception] = None
     for args in attempts:
         try:
-            return phase1a.classify_freshness(*args)
+            return fn(*args)
         except Exception as exc: # noqa: BLE001 - signature probing
             last_exc = exc
     raise last_exc # type: ignore[misc]
@@ -439,6 +507,33 @@ def _freshness_state(result: Any) -> str:
     if name == "STALE":
         return "fail"
     return "warn"
+
+def _call_phase1a_lifecycle(provider: Any = None) -> Any:
+    """Call the frozen Phase 1A lifecycle reporter, probing signatures."""
+    last_exc: Optional[Exception] = None
+    for fname in ("crypto_lifecycle", "trust_lifecycle"):
+        fn = getattr(phase1a, fname, None)
+        if not callable(fn):
+            continue
+        arg_sets = [()] if provider is None else [(), (provider,)]
+        for args in arg_sets:
+            try:
+                return fn(*args)
+            except Exception as exc: # noqa: BLE001 - signature probing
+                last_exc = exc
+    raise last_exc if last_exc is not None else RuntimeError("no lifecycle reporter")
+
+def _phase1a_lifecycle_value() -> Any:
+    """Return the raw frozen Phase 1A lifecycle value.
+
+    Calls crypto_lifecycle() and returns its value unchanged, so
+    trust_lifecycle()["lifecycle"] matches whatever the frozen Phase 1A
+    reporter produces.
+    """
+    try:
+        return _call_phase1a_lifecycle()
+    except Exception:
+        return "unknown"
 
 def _run_static_guard_check(errors: List[str]) -> Dict[str, str]:
     try:
@@ -550,7 +645,8 @@ def _run_freshness_check(
         policy = _build_policy(instrument, timeframe)
         result = _classify_freshness(policy, record, now)
         uname = str(getattr(result, "name", result)).upper()
-        ts = _one_of(record, ["received_at_utc", "timestamp", "time", "ts"])
+        ts = _one_of(record, ["received_at_utc", "received_at", "timestamp",
+                              "time", "ts", "event_time", "created_at"])
         age = (now - ts).total_seconds() if isinstance(ts, datetime) else -1.0
         return _check(_freshness_state(result), "class=%s age=%.1fs" % (uname, age))
     except Exception as exc:
@@ -558,19 +654,12 @@ def _run_freshness_check(
         return _check("fail", "freshness classification error: %s" % exc)
 
 def _run_lifecycle_check(provider: Any, errors: List[str]) -> Dict[str, str]:
-    last: Optional[Exception] = None
-    for fname in ("trust_lifecycle", "crypto_lifecycle"):
-        fn = getattr(phase1a, fname, None)
-        if not callable(fn):
-            continue
-        for args in ((), (provider,)):
-            try:
-                result = fn(*args)
-                return _check("pass", "%s ok: %s" % (fname, str(result)[:160]))
-            except Exception as exc: # noqa: BLE001 - signature probing
-                last = exc
-    errors.append("lifecycle: %s" % last)
-    return _check("warn", "lifecycle reporter unavailable: %s" % last)
+    try:
+        result = _call_phase1a_lifecycle(provider)
+        return _check("pass", "lifecycle ok: %s" % str(result)[:160])
+    except Exception as exc:
+        errors.append("lifecycle: %s: %s" % (type(exc).__name__, exc))
+        return _check("warn", "lifecycle reporter unavailable: %s" % exc)
 
 def trust_snapshot(
     provider: Optional[Any] = None,
@@ -583,9 +672,11 @@ def trust_snapshot(
     ALL parameters are optional: trust_snapshot() with no arguments
     evaluates a FixtureProvider at REFERENCE_EVALUATION_TIME for the
     fixture instrument/timeframe. Parameters may also be supplied
-    positionally or by keyword. Returns exactly: status, checks, errors,
-    evaluated_at, provider_id, symbol, timeframe. Categorical states
-    only; no numeric trust score.
+    positionally or by keyword.
+
+    Returns overall_state (the categorical verdict) plus status, checks,
+    errors, evaluated_at, provider_id, symbol, timeframe. Categorical
+    states only; no numeric trust score.
     """
     errors: List[str] = []
     checks: Dict[str, Dict[str, str]] = {}
@@ -604,14 +695,15 @@ def trust_snapshot(
 
     states = [check.get("state") for check in checks.values()]
     if "fail" in states:
-        status = UNTRUSTED
+        overall_state = UNTRUSTED
     elif "warn" in states:
-        status = DEGRADED
+        overall_state = DEGRADED
     else:
-        status = TRUSTED
+        overall_state = TRUSTED
 
     return {
-        "status": status,
+        "overall_state": overall_state,
+        "status": overall_state,
         "checks": checks,
         "errors": errors,
         "evaluated_at": now,
@@ -621,5 +713,21 @@ def trust_snapshot(
     }
 
 def trust_lifecycle() -> Dict[str, Any]:
-    """Zero-argument lifecycle snapshot using the fixture defaults."""
-    return trust_snapshot()
+    """Zero-argument lifecycle report for Phase 1B.
+
+    Returns {"phase": "1B", "lifecycle": <raw frozen Phase 1A
+    crypto_lifecycle() value>} merged with the trust snapshot fields.
+    """
+    snap = trust_snapshot()
+    return {
+        "phase": "1B",
+        "lifecycle": _phase1a_lifecycle_value(),
+        "overall_state": snap["overall_state"],
+        "status": snap["status"],
+        "checks": snap["checks"],
+        "errors": snap["errors"],
+        "evaluated_at": snap["evaluated_at"],
+        "provider_id": snap["provider_id"],
+        "symbol": snap["symbol"],
+        "timeframe": snap["timeframe"],
+    }
