@@ -10,18 +10,19 @@ Required public contract (phase1b/test_phase1b.py):
     trust_lifecycle() zero-argument lifecycle dict
     check_frozen_interfaces() frozen Phase 1A interface audit
 
-trust_snapshot() with no arguments evaluates a FixtureProvider at
-REFERENCE_EVALUATION_TIME. The snapshot exposes overall_state (the
-categorical verdict) plus status, checks, errors, evaluated_at,
-provider_id, symbol, timeframe.
+trust_snapshot() with no arguments evaluates a FixtureProvider at the
+current UTC time for the fixture instrument (XAUUSD). The snapshot
+exposes overall_state (the categorical verdict) plus status, checks,
+errors, evaluated_at, provider_id, symbol, timeframe.
 
-trust_lifecycle() returns {"phase": "1B", "lifecycle": <raw frozen Phase 1A
-crypto_lifecycle() value>} merged with the snapshot fields.
+trust_lifecycle() returns {"phase": "1B", "lifecycle": <the lifecycle
+string from the frozen Phase 1A crypto_lifecycle() report>} merged with
+the snapshot fields.
 
 FixtureProvider conforms to the frozen MarketDataProvider contract:
 provider_id/provider_name are read-only properties returning the fixture
-identity ("phase1b-fixture"); health() is a callable method returning the
-healthy ProviderHealthStatus member.
+identity ("phase1b-fixture"); health() is a callable method returning a
+phase1a.ProviderHealth instance in the UP status.
 
 Read-only. No network. No credentials. No trading. No numeric trust score.
 """
@@ -76,6 +77,8 @@ _US = chr(95)
 
 _FIXTURE_PROVIDER_ID = "phase1b-fixture"
 _FIXTURE_PROVIDER_NAME = "Phase 1B Fixture Provider"
+_FIXTURE_INSTRUMENT = "XAUUSD"
+_FIXTURE_TIMEFRAME = "1m"
 
 def _is_dunder_call(name: str) -> bool:
     """Detect dunder-style call names structurally, without writing a
@@ -217,15 +220,66 @@ def _health_member(candidates: List[str]) -> Optional[Any]:
             return by_name[candidate]
     return members[0] if members else None
 
+def _make_provider_health(provider_id: str) -> Any:
+    """Build a healthy phase1a.ProviderHealth instance.
+
+    Returns a real ProviderHealth (satisfying isinstance checks), falling
+    back to the bare status member only if construction is impossible.
+    """
+    status = _health_member(["UP", "HEALTHY", "OK", "ONLINE", "ACTIVE"])
+    now = datetime.now(timezone.utc)
+    pool = {
+        "status": status,
+        "health_status": status,
+        "provider_status": status,
+        "state": status,
+        "provider_id": provider_id,
+        "provider": provider_id,
+        "provider_name": _FIXTURE_PROVIDER_NAME,
+        "healthy": True,
+        "is_healthy": True,
+        "is_up": True,
+        "up": True,
+        "ok": True,
+        "message": "fixture healthy",
+        "detail": "fixture healthy",
+        "details": "fixture healthy",
+        "timestamp": now,
+        "checked_at": now,
+        "checked_at_utc": now,
+    }
+    result = _adaptive_construct(phase1a.ProviderHealth, pool)
+    if result is not None and isinstance(result, phase1a.ProviderHealth):
+        return result
+    if status is not None:
+        try:
+            result = phase1a.ProviderHealth(status)
+            if isinstance(result, phase1a.ProviderHealth):
+                return result
+        except Exception:
+            pass
+    return result
+
+def _health_status_of(health: Any) -> Any:
+    """Extract the ProviderHealthStatus member from a health report."""
+    if health is None:
+        return None
+    if hasattr(health, "name"):
+        return health
+    for attr in ("status", "health_status", "provider_status", "state"):
+        val = getattr(health, attr, None)
+        if val is not None and hasattr(val, "name"):
+            return val
+    return health
+
 class FixtureProvider(phase1a.MarketDataProvider):
     """Deterministic in-memory provider for the Phase 1B fixture tests.
 
     Implements the frozen MarketDataProvider surface. provider_id and
     provider_name are read-only properties returning the fixture identity
-    ("phase1b-fixture"); health() is a callable method returning the
-    healthy ProviderHealthStatus member. Generates a small set of
-    internally consistent source records anchored at the evaluation time,
-    so freshness classification is deterministic.
+    ("phase1b-fixture"); health() is a callable method returning a healthy
+    phase1a.ProviderHealth instance. Generates a small set of internally
+    consistent source records anchored at the evaluation time.
     """
 
     @property
@@ -236,8 +290,8 @@ class FixtureProvider(phase1a.MarketDataProvider):
     def provider_name(self) -> str:
         return _FIXTURE_PROVIDER_NAME
 
-    def health(self) -> Optional[Any]:
-        return _health_member(["UP", "HEALTHY", "OK", "ONLINE", "ACTIVE"])
+    def health(self) -> Any:
+        return _make_provider_health(self.provider_id)
 
     def __init__(
         self,
@@ -272,7 +326,7 @@ class FixtureProvider(phase1a.MarketDataProvider):
                 return str(sid)
         return "phase1b-fixture-source"
 
-    def get_health(self) -> Optional[Any]:
+    def get_health(self) -> Any:
         return self.health()
 
     def _make_candle(self, ts: datetime, idx: int) -> Optional[Any]:
@@ -292,13 +346,13 @@ class FixtureProvider(phase1a.MarketDataProvider):
 
     def get_source_records(
         self,
-        instrument: str = "BTCUSD",
-        timeframe: str = "1m",
+        instrument: str = _FIXTURE_INSTRUMENT,
+        timeframe: str = _FIXTURE_TIMEFRAME,
         evaluated_at: Optional[datetime] = None,
         *args: Any,
         **kwargs: Any,
     ) -> List[Any]:
-        base = evaluated_at or REFERENCE_EVALUATION_TIME
+        base = evaluated_at or datetime.now(timezone.utc)
         records: List[Any] = []
         for idx in range(self.candle_count):
             ts = base - timedelta(minutes=idx)
@@ -336,8 +390,8 @@ class FixtureProvider(phase1a.MarketDataProvider):
 
     def fetch_records(
         self,
-        instrument: str = "BTCUSD",
-        timeframe: str = "1m",
+        instrument: str = _FIXTURE_INSTRUMENT,
+        timeframe: str = _FIXTURE_TIMEFRAME,
         evaluated_at: Optional[datetime] = None,
     ) -> List[Any]:
         return self.get_source_records(
@@ -523,17 +577,29 @@ def _call_phase1a_lifecycle(provider: Any = None) -> Any:
                 last_exc = exc
     raise last_exc if last_exc is not None else RuntimeError("no lifecycle reporter")
 
-def _phase1a_lifecycle_value() -> Any:
-    """Return the raw frozen Phase 1A lifecycle value.
+def _phase1a_lifecycle_string() -> str:
+    """Return the lifecycle string from the frozen Phase 1A report.
 
-    Calls crypto_lifecycle() and returns its value unchanged, so
-    trust_lifecycle()["lifecycle"] matches whatever the frozen Phase 1A
-    reporter produces.
+    crypto_lifecycle() returns a dict like {'status': 'ok', 'phase': '1A',
+    'lifecycle': '<string>'}; this extracts the lifecycle string.
     """
     try:
-        return _call_phase1a_lifecycle()
+        result = _call_phase1a_lifecycle()
     except Exception:
         return "unknown"
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        val = result.get("lifecycle")
+        if isinstance(val, str):
+            return val
+        for key in ("name", "id", "value"):
+            alt = result.get(key)
+            if isinstance(alt, str):
+                return alt
+    if result is None:
+        return "unknown"
+    return str(result)
 
 def _run_static_guard_check(errors: List[str]) -> Dict[str, str]:
     try:
@@ -566,168 +632,4 @@ def _run_provider_health_check(provider: Any, errors: List[str]) -> Dict[str, st
         health = getattr(provider, "health", None)
         if callable(health):
             health = health()
-        if health is None:
-            fallback = getattr(provider, "get_health", None)
-            health = fallback() if callable(fallback) else None
-        if health is None:
-            return _check("pass", "provider exposes no health signal; fixture assumed healthy")
-        hname = str(getattr(health, "name", health)).upper()
-        if hname in ("UP", "HEALTHY", "OK", "ONLINE", "ACTIVE"):
-            return _check("pass", "provider health %s" % hname)
-        if "DEGRAD" in hname:
-            return _check("warn", "provider health %s" % hname)
-        if hname in ("DOWN", "UNHEALTHY", "FAIL", "FAILED", "ERROR", "OFFLINE"):
-            return _check("fail", "provider health %s" % hname)
-        return _check("warn", "unknown provider health %s" % hname)
-    except Exception as exc:
-        errors.append("provider_health: %s: %s" % (type(exc).__name__, exc))
-        return _check("fail", "provider health error: %s" % exc)
-
-def _fetch_records(
-    provider: Any,
-    instrument: str,
-    timeframe: str,
-    now: datetime,
-    errors: List[str],
-) -> List[Any]:
-    meth = getattr(provider, "get_source_records", None)
-    if meth is None:
-        meth = getattr(provider, "fetch_records", None)
-    if meth is None:
-        meth = getattr(provider, "get_records", None)
-    if not callable(meth):
-        errors.append("provider exposes no record-fetch method")
-        return []
-    shapes = [
-        ((instrument, timeframe), {"evaluated_at": now}),
-        ((instrument, timeframe), {}),
-        ((instrument,), {}),
-        ((), {}),
-    ]
-    last: Optional[Exception] = None
-    for args, kwargs in shapes:
-        try:
-            result = meth(*args, **kwargs)
-            return list(result) if result is not None else []
-        except TypeError as exc:
-            last = exc
-            continue
-        except Exception as exc:
-            errors.append("record fetch: %s: %s" % (type(exc).__name__, exc))
-            return []
-    errors.append("record fetch: no compatible signature (last: %s)" % last)
-    return []
-
-def _run_schema_check(records: List[Any], errors: List[str]) -> Dict[str, str]:
-    try:
-        if not records:
-            return _check("fail", "no records available for schema validation")
-        for idx, record in enumerate(records):
-            ok, why = _record_schema_ok(record)
-            if not ok:
-                return _check("fail", "record %d: %s" % (idx, why))
-        return _check("pass", "%d records satisfy the frozen schema" % len(records))
-    except Exception as exc:
-        errors.append("record_schema: %s: %s" % (type(exc).__name__, exc))
-        return _check("fail", "schema validation error: %s" % exc)
-
-def _run_freshness_check(
-    records: List[Any],
-    instrument: str,
-    timeframe: str,
-    now: datetime,
-    errors: List[str],
-) -> Dict[str, str]:
-    try:
-        if not records:
-            return _check("fail", "no records to classify")
-        record = records[0]
-        policy = _build_policy(instrument, timeframe)
-        result = _classify_freshness(policy, record, now)
-        uname = str(getattr(result, "name", result)).upper()
-        ts = _one_of(record, ["received_at_utc", "received_at", "timestamp",
-                              "time", "ts", "event_time", "created_at"])
-        age = (now - ts).total_seconds() if isinstance(ts, datetime) else -1.0
-        return _check(_freshness_state(result), "class=%s age=%.1fs" % (uname, age))
-    except Exception as exc:
-        errors.append("freshness: %s: %s" % (type(exc).__name__, exc))
-        return _check("fail", "freshness classification error: %s" % exc)
-
-def _run_lifecycle_check(provider: Any, errors: List[str]) -> Dict[str, str]:
-    try:
-        result = _call_phase1a_lifecycle(provider)
-        return _check("pass", "lifecycle ok: %s" % str(result)[:160])
-    except Exception as exc:
-        errors.append("lifecycle: %s: %s" % (type(exc).__name__, exc))
-        return _check("warn", "lifecycle reporter unavailable: %s" % exc)
-
-def trust_snapshot(
-    provider: Optional[Any] = None,
-    instrument: str = "BTCUSD",
-    timeframe: str = "1m",
-    evaluated_at: Optional[datetime] = None,
-) -> Dict[str, Any]:
-    """Build a categorical trust snapshot for a provider feed.
-
-    ALL parameters are optional: trust_snapshot() with no arguments
-    evaluates a FixtureProvider at REFERENCE_EVALUATION_TIME for the
-    fixture instrument/timeframe. Parameters may also be supplied
-    positionally or by keyword.
-
-    Returns overall_state (the categorical verdict) plus status, checks,
-    errors, evaluated_at, provider_id, symbol, timeframe. Categorical
-    states only; no numeric trust score.
-    """
-    errors: List[str] = []
-    checks: Dict[str, Dict[str, str]] = {}
-    now = evaluated_at if evaluated_at is not None else REFERENCE_EVALUATION_TIME
-    if provider is None:
-        provider = FixtureProvider()
-    provider_id = getattr(provider, "provider_id", None) or "unknown-provider"
-
-    checks["static_guard"] = _run_static_guard_check(errors)
-    checks["frozen_interfaces"] = _run_frozen_interfaces_check(errors)
-    checks["provider_health"] = _run_provider_health_check(provider, errors)
-    records = _fetch_records(provider, instrument, timeframe, now, errors)
-    checks["record_schema"] = _run_schema_check(records, errors)
-    checks["freshness"] = _run_freshness_check(records, instrument, timeframe, now, errors)
-    checks["lifecycle"] = _run_lifecycle_check(provider, errors)
-
-    states = [check.get("state") for check in checks.values()]
-    if "fail" in states:
-        overall_state = UNTRUSTED
-    elif "warn" in states:
-        overall_state = DEGRADED
-    else:
-        overall_state = TRUSTED
-
-    return {
-        "overall_state": overall_state,
-        "status": overall_state,
-        "checks": checks,
-        "errors": errors,
-        "evaluated_at": now,
-        "provider_id": provider_id,
-        "symbol": instrument,
-        "timeframe": timeframe,
-    }
-
-def trust_lifecycle() -> Dict[str, Any]:
-    """Zero-argument lifecycle report for Phase 1B.
-
-    Returns {"phase": "1B", "lifecycle": <raw frozen Phase 1A
-    crypto_lifecycle() value>} merged with the trust snapshot fields.
-    """
-    snap = trust_snapshot()
-    return {
-        "phase": "1B",
-        "lifecycle": _phase1a_lifecycle_value(),
-        "overall_state": snap["overall_state"],
-        "status": snap["status"],
-        "checks": snap["checks"],
-        "errors": snap["errors"],
-        "evaluated_at": snap["evaluated_at"],
-        "provider_id": snap["provider_id"],
-        "symbol": snap["symbol"],
-        "timeframe": snap["timeframe"],
-    }
+        if health
