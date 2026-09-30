@@ -137,50 +137,81 @@ def check_frozen_interfaces() -> Dict[str, Any]:
 
 
 def _adaptive_construct(cls: Any, pool: Dict[str, Any]) -> Optional[Any]:
+    """Build an instance using an ordered battery of strategies.
+
+    Order matters: try real values first, degrade gracefully.
+    Never poison required params with None before trying clean calls.
+    """
     try:
         sig = inspect.signature(cls)
     except (TypeError, ValueError):
-        try:
-            return cls()
-        except Exception:
-            return None
-    kwargs: Dict[str, Any] = {}
-    for pname, param in sig.parameters.items():
-        kind = param.kind.name
-        if kind in ("VAR_POSITIONAL", "VAR_KEYWORD"):
-            continue
-        if pname in pool:
-            kwargs[pname] = pool[pname]
-        elif param.default is inspect.Parameter.empty:
-            kwargs[pname] = None
-    try:
-        return cls(**kwargs)
-    except Exception:
-        pass
+        sig = None
+    if sig is not None:
+        params = [
+            p for p in sig.parameters.values()
+            if p.kind.name not in ("VAR_POSITIONAL", "VAR_KEYWORD")
+        ]
+        # Strategy 1: kwargs from pool, real (non-None) values only.
+        kwargs: Dict[str, Any] = {}
+        for p in params:
+            if p.name in pool and pool[p.name] is not None:
+                kwargs[p.name] = pool[p.name]
+        if kwargs:
+            try:
+                return cls(**kwargs)
+            except Exception:
+                pass
+        # Strategy 2: fill missing required params with None.
+        full_kwargs = dict(kwargs)
+        for p in params:
+            if p.name not in full_kwargs and p.default is inspect.Parameter.empty:
+                full_kwargs[p.name] = None
+        if full_kwargs != kwargs:
+            try:
+                return cls(**full_kwargs)
+            except Exception:
+                pass
+    # Strategy 3: no-arg construction.
     try:
         return cls()
     except Exception:
+        pass
+    return None
+
+
+def _resolve_status_member() -> Optional[Any]:
+    """Best-effort resolution of a healthy ProviderHealthStatus member."""
+    cls = getattr(phase1a, "ProviderHealthStatus", None)
+    if cls is None:
         return None
-
-
-def _health_member(candidates: List[str]) -> Optional[Any]:
+    candidates = (
+        "UP", "HEALTHY", "OK", "ONLINE", "ACTIVE",
+        "up", "healthy", "ok", "online", "active",
+        "GOOD", "good", "PASS", "pass", "RUNNING", "running",
+    )
+    for name in candidates:
+        try:
+            return getattr(cls, name)
+        except AttributeError:
+            continue
     try:
-        members = list(phase1a.ProviderHealthStatus)
+        members = list(cls)
     except Exception:
         return None
-    by_name: Dict[str, Any] = {}
+    healthy_names = frozenset(
+        ("UP", "HEALTHY", "OK", "ONLINE", "ACTIVE", "GOOD", "PASS", "RUNNING")
+    )
     for member in members:
-        by_name[str(getattr(member, "name", member))] = member
-    for candidate in candidates:
-        if candidate in by_name:
-            return by_name[candidate]
+        if str(getattr(member, "name", member)).upper() in healthy_names:
+            return member
     if members:
         return members[0]
     return None
 
 
 def _make_provider_health(provider_id: str) -> Any:
-    status = _health_member(["UP", "HEALTHY", "OK", "ONLINE", "ACTIVE"])
+    """Construct a real ProviderHealth via an exhaustive attempt battery."""
+    status = _resolve_status_member()
     now = datetime.now(timezone.utc)
     pool = {
         "status": status,
@@ -202,17 +233,37 @@ def _make_provider_health(provider_id: str) -> Any:
         "checked_at": now,
         "checked_at_utc": now,
     }
-    result = _adaptive_construct(phase1a.ProviderHealth, pool)
-    if result is not None and isinstance(result, phase1a.ProviderHealth):
-        return result
+    # Attempt 1: adaptive construction with the pool.
+    try:
+        result = _adaptive_construct(phase1a.ProviderHealth, pool)
+        if result is not None and isinstance(result, phase1a.ProviderHealth):
+            return result
+    except Exception:
+        pass
+    # Attempt 2: positional status.
     if status is not None:
         try:
-            attempt = phase1a.ProviderHealth(status)
+            result = phase1a.ProviderHealth(status)
+            if isinstance(result, phase1a.ProviderHealth):
+                return result
         except Exception:
-            attempt = None
-        if attempt is not None and isinstance(attempt, phase1a.ProviderHealth):
-            return attempt
-    return result
+            pass
+        # Attempt 3: keyword status under common names.
+        for key in ("status", "health_status", "provider_status", "state"):
+            try:
+                result = phase1a.ProviderHealth(**{key: status})
+                if isinstance(result, phase1a.ProviderHealth):
+                    return result
+            except Exception:
+                pass
+    # Attempt 4: no-arg.
+    try:
+        result = phase1a.ProviderHealth()
+        if isinstance(result, phase1a.ProviderHealth):
+            return result
+    except Exception:
+        pass
+    return None
 
 
 def _health_status_of(health_obj: Any) -> Any:
@@ -765,4 +816,3 @@ def trust_lifecycle() -> Dict[str, Any]:
         "symbol": snap["symbol"],
         "timeframe": snap["timeframe"],
     }
-
